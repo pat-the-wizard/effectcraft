@@ -75,7 +75,12 @@ Layers are referenced by id (from `get_comp`), `"#n"` (1-based index from the to
 referenced by id or name, and default to the active comp. Property paths come from `get_layer`, for
 example `transform/position`, `transform/opacity`, `effects/#1/blurriness` or `@57` (by uid). Times
 are in seconds. Keyframe times are layer time, which equals comp time unless the layer is offset or
-stretched.
+stretched; `prop.get`, `render_frame` and scripting use comp time. Pass `"timeBase": "comp"` to
+`add_keyframe`, `set_property`, `prop.set`, `prop.addKey`, `keys.set` or `keys.select` to give key
+times in comp time instead. `prop.addKey`, `keys.set`, `add_keyframe` and `set_property` with
+`time` say where each key landed (`compTime`) and warn when it is outside the layer's in/out range.
+A layer's start time is set with
+`execute_command layer.timing {"layers": ["Scene 2"], "start": 5.1}` (comp seconds).
 
 Command params are checked against each command's `params` doc. An unknown key, such as
 `layer.select {"index": 2}`, returns an error that lists the accepted keys (here `layers, add, toggle`)

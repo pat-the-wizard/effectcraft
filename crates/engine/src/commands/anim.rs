@@ -6,8 +6,8 @@ use effectcraft_project::{LayerId, Property, Uid};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::prop::prop_ref;
-use super::{CommandSpec, bad, comp_id, f_p, has_comp, has_keys, layers_p, merge_p, str_p, time_p};
+use super::prop::{key_placement, prop_ref};
+use super::{CommandSpec, bad, comp_id, f_p, has_comp, has_keys, layers_p, merge_p, str_p, time_base_p, time_p};
 use crate::{EngineError, KeyClip, KeyRef, Result, Session, cmd, query};
 
 fn has_key_clip(s: &Session) -> std::result::Result<(), String> {
@@ -206,11 +206,15 @@ fn nudge(s: &mut Session, p: &Value) -> Result<Value> {
 /// Edit one key directly: move it in time and/or set its value (Graph Editor drags).
 fn set_key(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = prop_ref(s, p, "keys.set")?;
-    let t = Tick::from_seconds_f64(f_p(p, "time").ok_or_else(|| bad("keys.set", "missing `time` (layer time of the key)"))?);
-    let new_t = f_p(p, "newTime").map(Tick::from_seconds_f64);
+    let base = time_base_p(p, "keys.set")?;
+    let layer = s.project.comp(cid).and_then(|c| c.layer(lid));
+    let to_layer = |t: Tick| layer.map_or(t, |l| base.to_layer(l, t));
+    let t =
+        to_layer(Tick::from_seconds_f64(f_p(p, "time").ok_or_else(|| bad("keys.set", "missing `time` (the key's time, layer time unless timeBase is comp)"))?));
+    let new_t = f_p(p, "newTime").map(Tick::from_seconds_f64).map(to_layer);
     let value = p.get("value").cloned();
     let fr = s.project.comp(cid).map(|c| c.frame_rate);
-    s.edit("Edit Keyframe", merge_p(p), |proj, st| {
+    let nt = s.edit("Edit Keyframe", merge_p(p), |proj, st| {
         let l = super::layer_mut(proj, cid, lid)?;
         let pr = l.props.find_mut(uid).ok_or_else(|| bad("keys.set", "no property"))?;
         let i = nearest_key(&pr.keys, t).ok_or_else(|| bad("keys.set", "the property has no keyframes"))?;
@@ -233,8 +237,10 @@ fn set_key(s: &mut Session, p: &Value) -> Result<Value> {
         for k in st.selected_keys.iter_mut().filter(|k| k.layer == lid && k.prop == uid && k.time == old_t) {
             k.time = nt;
         }
-        Ok(json!({"time": nt.seconds()}))
-    })
+        Ok(nt)
+    })?;
+    // `{time, compTime, warning?}`: where the key sits now.
+    Ok(s.project.comp(cid).and_then(|c| c.layer(lid)).map_or_else(|| json!({"time": nt.seconds()}), |l| key_placement(l, nt)))
 }
 
 fn nearest_key(keys: &[Keyframe], t: Tick) -> Option<usize> {
@@ -449,7 +455,15 @@ pub fn specs() -> Vec<CommandSpec> {
             s,
             &json!({"frames": -10})
         )),
-        cmd!("keys.set", "Edit Keyframe", [], None, "{layer?, path|prop, time (layer s), newTime?, value?, merge?}", has_comp, set_key),
+        cmd!(
+            "keys.set",
+            "Edit Keyframe",
+            [],
+            None,
+            "{layer?, path|prop, time (layer s, or comp s with timeBase comp), newTime?, value?, timeBase?: layer|comp (how time and newTime are read; default layer), merge?}",
+            has_comp,
+            set_key
+        ),
         cmd!("keys.selectEqual", "Select Equal Keyframes", [], None, "{}", has_keys, |s, _| select_related(s, "equal")),
         cmd!("keys.selectPrevious", "Select Previous Keyframes", [], None, "{}", has_keys, |s, _| select_related(s, "previous")),
         cmd!("keys.selectFollowing", "Select Following Keyframes", [], None, "{}", has_keys, |s, _| select_related(s, "following")),

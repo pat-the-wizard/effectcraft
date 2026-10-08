@@ -260,14 +260,19 @@ fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
     if value.is_none() && expr.is_none() {
         return Err(Error::BadArgs("give `value` and/or `expression`".into()));
     }
+    let time_base = get(a, "timeBase");
     let base = [("layer", Some(layer)), ("path", Some(path)), ("comp", comp)];
+    let mut added: Option<Value> = None;
     if let Some(v) = value {
         let mut p = obj(&base);
         p["value"] = v.clone();
         match time {
             Some(t) => {
                 p["time"] = t.clone();
-                b.exec("prop.addKey", p)?;
+                if let Some(tb) = time_base {
+                    p["timeBase"] = tb.clone();
+                }
+                added = Some(b.exec("prop.addKey", p)?);
             }
             None => {
                 b.exec("prop.set", p)?;
@@ -279,7 +284,12 @@ fn set_property(b: &mut Backend, a: &Value) -> Result<Reply> {
         p["expression"] = e.clone();
         b.exec("prop.setExpression", p)?;
     }
-    json_reply(b.exec("prop.get", obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp), ("time", time)]))?)
+    let mut reply = b.exec("prop.get", obj(&[("layer", Some(layer)), ("path", Some(path)), ("comp", comp), ("time", time)]))?;
+    // Where the key went (comp time) and a warning when it is outside the layer (#257).
+    if let Some(k) = added {
+        reply["key"] = k;
+    }
+    json_reply(reply)
 }
 
 fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -292,14 +302,19 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
     if keys.is_empty() {
         return Err(Error::BadArgs("no keys".into()));
     }
+    let time_base = get(a, "timeBase");
     let base = [("layer", Some(layer)), ("path", Some(path)), ("comp", comp)];
+    let mut added: Vec<Value> = Vec::with_capacity(keys.len());
     for k in &keys {
         let mut p = obj(&base);
         p["time"] = need(k, "time")?.clone();
         if let Some(v) = get(k, "value") {
             p["value"] = v.clone();
         }
-        b.exec("prop.addKey", p)?;
+        if let Some(tb) = time_base {
+            p["timeBase"] = tb.clone();
+        }
+        added.push(b.exec("prop.addKey", p)?);
     }
     let info = b.exec("prop.get", obj(&base))?;
     if let Some(interp) = get(a, "interpolation").and_then(Value::as_str) {
@@ -308,7 +323,11 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
             b.exec("comp.open", json!({"comp": c}))?;
         }
         let sel: Vec<Value> = keys.iter().map(|k| json!({"layer": info["layer"], "prop": info["uid"], "time": k["time"]})).collect();
-        b.exec("keys.select", json!({"keys": sel}))?;
+        let mut sp = json!({"keys": sel});
+        if let Some(tb) = time_base {
+            sp["timeBase"] = tb.clone();
+        }
+        b.exec("keys.select", sp)?;
         match interp.to_ascii_lowercase().as_str() {
             "easyease" | "ease" => b.exec("keys.easyEase", json!({}))?,
             "easyeasein" => b.exec("keys.easyEase", json!({"which": "in"}))?,
@@ -316,9 +335,20 @@ fn add_keyframe(b: &mut Backend, a: &Value) -> Result<Reply> {
             i @ ("linear" | "bezier" | "hold") => b.exec("keys.interpolation", json!({"interpolation": i}))?,
             other => return Err(Error::BadArgs(format!("unknown interpolation `{other}` (linear, bezier, hold, easyEase, easyEaseIn, easyEaseOut)"))),
         };
-        return json_reply(b.exec("prop.get", obj(&base))?);
+        return json_reply(with_added(b.exec("prop.get", obj(&base))?, added));
     }
-    json_reply(info)
+    json_reply(with_added(info, added))
+}
+
+/// The property reply plus `added` (each new key's `{time, compTime}`) and, when any key landed
+/// outside its layer, `warnings` (#257).
+fn with_added(mut reply: Value, added: Vec<Value>) -> Value {
+    let warnings: Vec<Value> = added.iter().filter_map(|k| k.get("warning").cloned()).collect();
+    if !warnings.is_empty() {
+        reply["warnings"] = Value::Array(warnings);
+    }
+    reply["added"] = Value::Array(added);
+    reply
 }
 
 fn render_frame(b: &mut Backend, a: &Value) -> Result<Reply> {
@@ -563,13 +593,14 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "set_property",
-        description: "Set a property. Without `time`: sets the static value (or a key at the current time if already animated). With `time`: adds/replaces a keyframe there, turning the stopwatch on. `expression` sets an After Effects-style JS expression (\"\" removes it). Returns the property as get_property does. Examples: {\"layer\":3,\"path\":\"transform/opacity\",\"value\":50}; {\"layer\":\"Title\",\"path\":\"transform/position\",\"value\":[200,540],\"time\":0}; {\"layer\":3,\"path\":\"transform/rotation\",\"expression\":\"time*90\"}.",
+        description: "Set a property. Without `time`: sets the static value (or a key at the current time if already animated). With `time`: adds/replaces a keyframe there, turning the stopwatch on; the reply's `key` says where it landed (`compTime`, and a `warning` when that is outside the layer). `expression` sets an After Effects-style JS expression (\"\" removes it). Returns the property as get_property does. Examples: {\"layer\":3,\"path\":\"transform/opacity\",\"value\":50}; {\"layer\":\"Title\",\"path\":\"transform/position\",\"value\":[200,540],\"time\":0}; {\"layer\":3,\"path\":\"transform/rotation\",\"expression\":\"time*90\"}.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "layer": layer_s(), "path": path_s(), "value": value_s(), "comp": comp_s(),
-                    "time": {"type": "number", "description": "Keyframe time in seconds (layer time; equals comp time unless the layer is offset/stretched)."},
+                    "time": {"type": "number", "description": "Keyframe time in seconds (layer time by default; equals comp time unless the layer is offset/stretched; see timeBase)."},
+                    "timeBase": {"type": "string", "enum": ["layer", "comp"], "description": "How `time` is read: layer time (default) or comp time, the base get_property and render_frame use. Use comp on layers that don't start at 0, such as nested comps placed later."},
                     "expression": {"type": "string", "description": "Expression text; empty string removes the expression."}
                 }),
                 &["layer", "path"],
@@ -579,13 +610,14 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "add_keyframe",
-        description: "Add keyframes to a property (turns the stopwatch on): one with `time` (+ optional `value`, default the current value) or many with `keys: [{time, value}]`, then optionally set their `interpolation`: linear, bezier, hold, easyEase, easyEaseIn, easyEaseOut. Example: {\"layer\":1,\"path\":\"transform/position\",\"keys\":[{\"time\":0,\"value\":[0,540]},{\"time\":2,\"value\":[1920,540]}],\"interpolation\":\"easyEase\"}.",
+        description: "Add keyframes to a property (turns the stopwatch on): one with `time` (+ optional `value`, default the current value) or many with `keys: [{time, value}]`, then optionally set their `interpolation`: linear, bezier, hold, easyEase, easyEaseIn, easyEaseOut. The reply adds `added` (each new key's `time` and `compTime`) and `warnings` when a key lands outside the layer's in/out range. Example: {\"layer\":1,\"path\":\"transform/position\",\"keys\":[{\"time\":0,\"value\":[0,540]},{\"time\":2,\"value\":[1920,540]}],\"interpolation\":\"easyEase\"}.",
         bridge_only: false,
         schema: || {
             schema(
                 json!({
                     "layer": layer_s(), "path": path_s(), "comp": comp_s(),
-                    "time": {"type": "number", "description": "Key time in seconds (layer time)."},
+                    "time": {"type": "number", "description": "Key time in seconds (layer time by default; see timeBase)."},
+                    "timeBase": {"type": "string", "enum": ["layer", "comp"], "description": "How `time` is read: layer time (default) or comp time, the base get_property and render_frame use. Use comp on layers that don't start at 0, such as nested comps placed later."},
                     "value": value_s(),
                     "keys": {"type": "array", "items": {"type": "object", "properties": {"time": {"type": "number"}, "value": value_s()}, "required": ["time"]}, "description": "Several keys at once."},
                     "interpolation": {"type": "string", "enum": ["linear", "bezier", "hold", "easyEase", "easyEaseIn", "easyEaseOut"]}

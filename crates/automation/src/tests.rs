@@ -507,3 +507,39 @@ fn agents_doc_tools_table_is_current() {
     }
     assert!(missing.is_empty(), "docs/agents.md's Tools table is missing: {missing:#?}");
 }
+
+/// `add_keyframe` and `set_property` pass `timeBase` through, so keys on a layer that starts later
+/// land at the comp time `get_property` reads (#257).
+#[test]
+fn keyframe_tools_take_comp_time() {
+    let mut s = server();
+    rpc(&mut s, 1, "initialize", json!({"protocolVersion": "2025-06-18"}));
+    call_json(
+        &mut s,
+        "execute_command",
+        json!({"command": "comp.new", "params": {"name": "Main", "width": 320, "height": 180, "frameRate": 30, "duration": 20}}),
+    );
+    let l = call_json(&mut s, "execute_command", json!({"command": "layer.newSolid", "params": {"color": "#ffffff"}}))["layer"].clone();
+    // Like a 5.5 s precomp placed at 10.5 s: the layer runs from 10.5 s to 16 s comp time.
+    call_json(&mut s, "execute_command", json!({"command": "layer.timing", "params": {"layers": [l], "start": 10.5}}));
+    call_json(&mut s, "execute_command", json!({"command": "layer.timing", "params": {"layers": [l], "out": 16.0}}));
+
+    let r = call_json(
+        &mut s,
+        "add_keyframe",
+        json!({"layer": l, "path": "transform/opacity", "keys": [{"time": 15.3, "value": 0}, {"time": 16.0, "value": 100}], "timeBase": "comp", "interpolation": "linear"}),
+    );
+    assert!(r.get("warnings").is_none(), "{r}");
+    assert!((r["added"][0]["compTime"].as_f64().unwrap() - 15.3).abs() < 1e-6, "{r}");
+    let mid = call_json(&mut s, "get_property", json!({"layer": l, "path": "transform/opacity", "time": 15.65}));
+    assert!((mid["value"].as_f64().unwrap() - 50.0).abs() < 1.0, "{mid}");
+
+    // The same keys in the default (layer) base land after the layer ends: the reply warns.
+    let r = call_json(&mut s, "add_keyframe", json!({"layer": l, "path": "transform/rotation", "keys": [{"time": 15.3, "value": 0}]}));
+    assert!((r["added"][0]["compTime"].as_f64().unwrap() - 25.8).abs() < 1e-6, "{r}");
+    assert!(r["warnings"][0].as_str().is_some_and(|w| w.contains("outside layer")), "{r}");
+
+    let p = call_json(&mut s, "set_property", json!({"layer": l, "path": "transform/opacity", "value": 25, "time": 17.0, "timeBase": "comp"}));
+    assert!((p["value"].as_f64().unwrap() - 25.0).abs() < 1e-6, "{p}");
+    assert!(p["key"]["warning"].as_str().is_some_and(|w| w.contains("outside layer")), "comp 17 s is after the layer's out point: {p}");
+}

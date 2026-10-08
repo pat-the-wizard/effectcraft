@@ -5,7 +5,7 @@ use effectcraft_project::{GroupKind, ItemId, Layer, LayerId, Property, Uid};
 use effectcraft_time::Tick;
 use serde_json::{Value, json};
 
-use super::{CommandSpec, b_p, bad, f_p, has_comp, has_keys, has_layers, layer_mut, layer_p, layers_p, merge_p, str_p};
+use super::{CommandSpec, TimeBase, b_p, bad, f_p, has_comp, has_keys, has_layers, layer_mut, layer_p, layers_p, merge_p, str_p, time_base_p};
 use crate::{EngineError, KeyRef, Result, Session, VertexRef, cmd, query};
 
 /// Resolve `{layer, path}` (or `{layer, prop: uid}`) to (comp, layer, prop uid).
@@ -51,11 +51,33 @@ fn with_prop<T>(
 }
 
 /// An explicit key time (layer seconds) moved onto the nearest comp frame.
-fn snapped_key_time(s: &Session, cid: ItemId, lid: LayerId, p: &Value) -> Option<Tick> {
+/// Where a key at layer time `lt` sits: `{time, compTime}` and, when that comp time is outside
+/// the layer's in/out range (so the key never shows in the comp), a `warning` that says so (#257).
+pub(crate) fn key_placement(l: &Layer, lt: Tick) -> Value {
+    let ct = l.comp_time(lt);
+    let mut r = json!({"time": lt.seconds(), "compTime": ct.seconds()});
+    if ct < l.in_point || ct > l.out_point {
+        r["warning"] = json!(format!(
+            "the key at comp {:.3} s is outside layer `{}` ({:.3} to {:.3} s); key times are layer time unless timeBase is comp",
+            ct.seconds(),
+            l.name,
+            l.in_point.seconds(),
+            l.out_point.seconds()
+        ));
+    }
+    r
+}
+
+/// The layer time of `p.time`, read in `base` and snapped to the comp's frame grid.
+fn snapped_key_time(s: &Session, cid: ItemId, lid: LayerId, p: &Value, base: TimeBase) -> Option<Tick> {
     let t = Tick::from_seconds_f64(f_p(p, "time")?);
     let comp = s.project.comp(cid)?;
     let l = comp.layer(lid)?;
-    Some(l.layer_time(comp.frame_rate.snap_nearest(l.comp_time(t))))
+    let comp_t = match base {
+        TimeBase::Layer => l.comp_time(t),
+        TimeBase::Comp => t,
+    };
+    Some(l.layer_time(comp.frame_rate.snap_nearest(comp_t)))
 }
 
 fn set(s: &mut Session, p: &Value) -> Result<Value> {
@@ -87,7 +109,8 @@ fn set(s: &mut Session, p: &Value) -> Result<Value> {
         return Ok(json!(out));
     }
     let v = p.get("value").ok_or_else(|| bad("prop.set", "missing `value`"))?.clone();
-    let at = snapped_key_time(s, cid, lid, p);
+    let base = time_base_p(p, "prop.set")?;
+    let at = snapped_key_time(s, cid, lid, p, base);
     let out = with_prop(s, "Change Property", merge_p(p), cid, lid, uid, |pr, lt| {
         let cur = pr.value_at(lt);
         let mut nv = cur.coerce_json(&v).ok_or_else(|| bad("prop.set", format!("can't use {v} for a {} property", cur.kind_name())))?;
@@ -156,9 +179,10 @@ fn toggle_anim(s: &mut Session, p: &Value) -> Result<Value> {
 
 fn add_key(s: &mut Session, p: &Value) -> Result<Value> {
     let (cid, lid, uid) = prop_ref(s, p, "prop.addKey")?;
-    let at = snapped_key_time(s, cid, lid, p);
+    let base = time_base_p(p, "prop.addKey")?;
+    let at = snapped_key_time(s, cid, lid, p, base);
     let value = p.get("value").cloned();
-    with_prop(s, "Add Keyframe", None, cid, lid, uid, |pr, lt| {
+    let (n, t) = with_prop(s, "Add Keyframe", None, cid, lid, uid, |pr, lt| {
         let t = at.unwrap_or(lt);
         let cur = pr.value_at(t);
         let v = match &value {
@@ -170,8 +194,12 @@ fn add_key(s: &mut Session, p: &Value) -> Result<Value> {
             k = k.hold();
         }
         set_key(&mut pr.keys, k);
-        Ok(json!(pr.keys.len()))
-    })
+        Ok((pr.keys.len(), t))
+    })?;
+    // `{keys, time, compTime, warning?}`: the key count, and where the new key sits.
+    let mut r = s.project.comp(cid).and_then(|c| c.layer(lid)).map_or_else(|| json!({"time": t.seconds()}), |l| key_placement(l, t));
+    r["keys"] = json!(n);
+    Ok(r)
 }
 
 fn toggle_key(s: &mut Session, p: &Value) -> Result<Value> {
@@ -339,6 +367,7 @@ fn path_points(l: &Layer, uid: Uid, lt: Tick) -> Option<(Uid, usize)> {
 // ---------------------------------------------------------------- keyframes
 
 fn select_keys(s: &mut Session, p: &Value) -> Result<Value> {
+    let base = time_base_p(p, "keys.select")?;
     let comp = s.active_comp().ok_or(EngineError::NoComp)?;
     let mut sel = vec![];
     if let Some(Value::Array(keys)) = p.get("keys") {
@@ -356,6 +385,7 @@ fn select_keys(s: &mut Session, p: &Value) -> Result<Value> {
             }
             .ok_or_else(|| bad("keys.select", format!("{k}: no such property on layer {lv}")))?;
             let t = k.get("time").and_then(Value::as_f64).map(Tick::from_seconds_f64).ok_or_else(|| bad("keys.select", format!("{k}: missing `time`")))?;
+            let t = base.to_layer(ly, t);
             // Snap to the stored key time.
             let kt = pr
                 .keys
@@ -768,9 +798,25 @@ fn convert_expr_to_keys(s: &mut Session, p: &Value) -> Result<Value> {
 pub fn specs() -> Vec<CommandSpec> {
     vec![
         query!("prop.get", "Get Property", "{layer?, path|prop, time? (comp s)}", get),
-        cmd!("prop.set", "Set Property Value", [], None, "{layer?, path|prop, value, time?, merge?}", has_layers, set),
+        cmd!(
+            "prop.set",
+            "Set Property Value",
+            [],
+            None,
+            "{layer?, path|prop, value, time?, timeBase?: layer|comp (how `time` is read; default layer), merge?}",
+            has_layers,
+            set
+        ),
         cmd!("prop.toggleAnimation", "Toggle Stopwatch", [], None, "{layer?, path|prop, value?}", has_layers, toggle_anim),
-        cmd!("prop.addKey", "Add Keyframe", [], None, "{layer?, path|prop, time?, value?}", has_layers, add_key),
+        cmd!(
+            "prop.addKey",
+            "Add Keyframe",
+            [],
+            None,
+            "{layer?, path|prop, time?, value?, timeBase?: layer|comp (how `time` is read; default layer)}",
+            has_layers,
+            add_key
+        ),
         cmd!("prop.toggleKey", "Add or Remove Keyframe at Current Time", [], None, "{layer?, path|prop}", has_layers, toggle_key),
         cmd!(
             "keys.toggleTransform",
@@ -798,7 +844,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Select Keyframes",
             [],
             None,
-            "{keys: [{layer, prop: uid | path (or `path`), time (layer s)}], add?, toggle?: bool (Shift+click: in or out of the selection), selectProperties?: bool (their properties and layers too, as a Timeline click does)}",
+            "{keys: [{layer, prop: uid | path (or `path`), time (layer s, or comp s with timeBase comp)}], add?, toggle?: bool (Shift+click: in or out of the selection), selectProperties?: bool (their properties and layers too, as a Timeline click does), timeBase?: layer|comp (how every `time` is read; default layer)}",
             has_comp,
             select_keys
         ),

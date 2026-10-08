@@ -439,6 +439,33 @@ pub(crate) fn f_p(p: &Value, k: &str) -> Option<f64> {
 pub(crate) fn b_p(p: &Value, k: &str) -> Option<bool> {
     p.get(k).and_then(Value::as_bool)
 }
+
+/// How a command reads its key times: layer time (the default, how keys are stored) or comp time
+/// (`timeBase: "comp"`, the base `prop.get` and rendering use). See #257.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum TimeBase {
+    Layer,
+    Comp,
+}
+
+impl TimeBase {
+    /// The layer time of `t` given in this base (start time and stretch aware).
+    pub(crate) fn to_layer(self, l: &Layer, t: Tick) -> Tick {
+        match self {
+            TimeBase::Layer => t,
+            TimeBase::Comp => l.layer_time(t),
+        }
+    }
+}
+
+/// `timeBase`: `"layer"` (default) or `"comp"`; anything else is an error naming both.
+pub(crate) fn time_base_p(p: &Value, cmd: &str) -> Result<TimeBase> {
+    match str_p(p, "timeBase") {
+        None | Some("layer") => Ok(TimeBase::Layer),
+        Some("comp") => Ok(TimeBase::Comp),
+        Some(o) => Err(bad(cmd, format!("timeBase: `{o}` is not `layer` or `comp`"))),
+    }
+}
 pub(crate) fn merge_p(p: &Value) -> Option<&str> {
     str_p(p, "merge")
 }

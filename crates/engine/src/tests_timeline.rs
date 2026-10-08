@@ -618,3 +618,47 @@ fn toggle_transform_key_covers_selected_layers_separated_position_and_3d_rotatio
     }
     assert!(s.execute("keys.toggleTransform", json!({"prop": "skew"})).is_err());
 }
+
+/// `timeBase: "comp"` reads key times as comp time on a layer that starts later (#257); the
+/// default stays layer time, and an unknown base is an error.
+#[test]
+fn key_times_in_comp_time_on_an_offset_layer() {
+    let (mut s, l) = setup();
+    s.execute("layer.timing", json!({"layers": [l], "start": 1.0})).unwrap();
+    let times = |s: &Session| -> Vec<f64> { prop(s, l, "transform/opacity").keys.iter().map(|k| (k.time.seconds() * 30.0).round() / 30.0).collect() };
+
+    // Default: layer time. Comp time: 2.5 s comp is 1.5 s into the layer. The reply says where
+    // each key sits in both bases.
+    let r = s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": 0.5, "value": 10})).unwrap();
+    assert_eq!((r["time"].as_f64(), r["compTime"].as_f64(), r["keys"].as_u64()), (Some(0.5), Some(1.5), Some(1)), "{r}");
+    assert!(r.get("warning").is_none(), "{r}");
+    let r = s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": 2.5, "value": 90, "timeBase": "comp"})).unwrap();
+    assert_eq!((r["time"].as_f64(), r["compTime"].as_f64()), (Some(1.5), Some(2.5)), "{r}");
+    assert_eq!(times(&s), vec![0.5, 1.5]);
+
+    // A key outside the layer's in/out range is still added, with a warning.
+    let r = s.execute("prop.addKey", json!({"layer": l, "path": "transform/rotation", "time": 10.0, "value": 45})).unwrap();
+    assert_eq!(r["compTime"].as_f64(), Some(11.0), "{r}");
+    assert!(r["warning"].as_str().is_some_and(|w| w.contains("outside layer")), "{r}");
+
+    // prop.set with a time keys the property at the converted time (comp 3.5 s = layer 2.5 s).
+    s.execute("prop.set", json!({"layer": l, "path": "transform/opacity", "time": 3.5, "value": 40, "timeBase": "comp"})).unwrap();
+    assert_eq!(times(&s), vec![0.5, 1.5, 2.5]);
+
+    // keys.set: the key at comp 2.5 s moves to comp 3.0 s (layer 1.5 s to 2.0 s), with undo/redo.
+    let r = s.execute("keys.set", json!({"layer": l, "path": "transform/opacity", "time": 2.5, "newTime": 3.0, "timeBase": "comp"})).unwrap();
+    assert_eq!((r["time"].as_f64(), r["compTime"].as_f64()), (Some(2.0), Some(3.0)), "{r}");
+    undo_redo_roundtrip(&mut s, |s| assert_eq!(times(s), vec![0.5, 2.0, 2.5]), |s| assert_eq!(times(s), vec![0.5, 1.5, 2.5]));
+
+    // keys.select: comp 3.0 s is the layer-2.0 s key; read as layer time it would be the 2.5 s key.
+    s.execute("keys.select", json!({"keys": [{"layer": l, "path": "transform/opacity", "time": 3.0}], "timeBase": "comp"})).unwrap();
+    assert_eq!(s.state.selected_keys.len(), 1);
+    assert!((s.state.selected_keys[0].time.seconds() - 2.0).abs() < 1e-6);
+    s.execute("keys.select", json!({"keys": [{"layer": l, "path": "transform/opacity", "time": 3.0}]})).unwrap();
+    assert!((s.state.selected_keys[0].time.seconds() - 2.5).abs() < 1e-6);
+
+    // An unknown base is rejected and changes nothing.
+    let err = s.execute("prop.addKey", json!({"layer": l, "path": "transform/opacity", "time": 1.0, "timeBase": "frames"}));
+    assert!(err.unwrap_err().to_string().contains("timeBase"));
+    assert_eq!(times(&s), vec![0.5, 2.0, 2.5]);
+}
