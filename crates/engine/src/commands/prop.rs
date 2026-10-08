@@ -16,7 +16,14 @@ pub(crate) fn prop_ref(s: &Session, p: &Value, cmd: &str) -> Result<(ItemId, Lay
         return layer.props.find(u).map(|pr| (cid, lid, pr.uid)).ok_or_else(|| bad(cmd, format!("no property @{u}")));
     }
     let path = str_p(p, "path").ok_or_else(|| bad(cmd, "missing `path` (e.g. transform/position) or `prop` uid"))?;
-    let pr = layer.props.prop(path).ok_or_else(|| bad(cmd, format!("no property `{path}`")))?;
+    let pr = layer.props.prop(path).ok_or_else(|| {
+        // A group (`transform`, `geometryOptions`…) has no value of its own (#263).
+        if layer.props.group(path).is_some() {
+            bad(cmd, format!("`{path}` is a property group; use get_layer to read its properties"))
+        } else {
+            bad(cmd, format!("no property `{path}`"))
+        }
+    })?;
     Ok((cid, lid, pr.uid))
 }
 

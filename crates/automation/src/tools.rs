@@ -564,7 +564,7 @@ static TOOLS: &[ToolDef] = &[
     },
     ToolDef {
         name: "get_layer",
-        description: "A layer's property tree (transform, masks, effects, text, shape contents, ...): every node has a `path` usable with get_property/set_property/add_keyframe, plus uid, match id, name, type, value at `time`, keyframes and expression. `flat: true` returns just a list of {path, type, value, keys, expression} (compact).",
+        description: "A layer's property tree (transform, masks, effects, text, shape contents, ...): every node has a `path` (a property's works with get_property/set_property/add_keyframe; a group's with get_layer only), plus uid, match id, name, type, value at `time`, keyframes and expression. `flat: true` returns just a list of {path, type, value, keys, expression} (compact).",
         bridge_only: false,
         schema: || {
             schema(

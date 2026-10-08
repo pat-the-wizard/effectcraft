@@ -662,3 +662,15 @@ fn key_times_in_comp_time_on_an_offset_layer() {
     assert!(err.unwrap_err().to_string().contains("timeBase"));
     assert_eq!(times(&s), vec![0.5, 2.0, 2.5]);
 }
+
+/// A group path is named as a group, with a pointer to get_layer, instead of "no property" (#263).
+#[test]
+fn group_path_errors_point_at_get_layer() {
+    let (mut s, l) = setup();
+    let e = s.execute("prop.get", json!({"layer": l, "path": "transform"})).unwrap_err().to_string();
+    assert!(e.contains("`transform` is a property group") && e.contains("get_layer"), "{e}");
+    let e = s.execute("prop.set", json!({"layer": l, "path": "transform", "value": 1})).unwrap_err().to_string();
+    assert!(e.contains("property group"), "{e}");
+    let e = s.execute("prop.get", json!({"layer": l, "path": "transform/nope"})).unwrap_err().to_string();
+    assert!(e.contains("no property `transform/nope`"), "{e}");
+}
