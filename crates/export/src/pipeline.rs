@@ -9,17 +9,22 @@ use effectcraft_project::render_queue::{
 };
 use effectcraft_project::{Comp, Project};
 use effectcraft_raster::Image;
-use effectcraft_render::{RenderOpts, Renderer};
+use effectcraft_render::{LayerCache, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 use web_time::Instant;
 
 use crate::{Job, RenderQuality, out};
 
-/// A job being exported: the job, the project with the Render Settings overrides applied, and
-/// per-frame timing for the render log.
+/// A job being exported: the job, the project with the Render Settings overrides applied, the
+/// job's layer cache and per-frame timing for the render log.
 pub(crate) struct Cx<'a> {
     pub job: &'a Job<'a>,
     pub project: Project,
+    /// Processed layer pixels shared by all of the job's frames, as the viewer's playback does:
+    /// a layer whose content doesn't change (static, or animated only in its transform) renders
+    /// once per job instead of once per frame. Keys hash the evaluated inputs, so every frame
+    /// equals an uncached render.
+    pub cache: LayerCache,
     /// (output frame, seconds) of every rendered frame (Plus Per Frame Info logs).
     pub frame_times: Option<Mutex<Vec<(u64, f64)>>>,
     /// Files written to an overflow folder.
@@ -68,7 +73,10 @@ impl<'a> Cx<'a> {
         let mut project = job.project.clone();
         apply_overrides(&mut project, job);
         let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
-        Cx { job, project, frame_times, overflowed: Mutex::new(vec![]) }
+        let cache = LayerCache::default();
+        // Deferred GPU readbacks: pixels computed while a pass misses are placeholders.
+        cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
+        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]) }
     }
 
     pub fn comp(&self) -> Option<&Comp> {
@@ -93,6 +101,7 @@ impl<'a> Cx<'a> {
         let mut r = Renderer::new(&self.project, self.job.footage, opts);
         r.expr = self.job.expr;
         r.accel = self.job.accel;
+        r.cache = Some(&self.cache);
         // With deferred GPU readbacks (a browser worker) the frame renders in passes.
         effectcraft_render::passes::comp_frame(&r, self.job.comp, t).await
     }
@@ -351,5 +360,79 @@ mod tests {
         assert_eq!(p.data[0], [0.0; 4]);
         assert_eq!(p.data[4][0], 0.0);
         assert_eq!(p.data[5][0], 1.0);
+    }
+
+    /// 64×48 at 30 fps: a static red block, a white bar sweeping left to right (animated only in
+    /// its transform) and a white solid whose mask path moves every frame (its content changes).
+    fn three_layers() -> (Project, effectcraft_project::ItemId) {
+        use effectcraft_color::Label;
+        use effectcraft_keyframe::{Keyframe, ShapePath, Value};
+        use effectcraft_project::build::{self, Ids};
+        use effectcraft_project::{ItemKind, LayerSource, MaskMode, Node, Solid};
+        use effectcraft_time::FrameRate;
+        let mut p = Project::default();
+        let mut comp = Comp::new(64, 48, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
+        let solid = |p: &mut Project, comp: &Comp, name: &str, color: [f32; 3], (w, h): (u32, u32)| {
+            let id = p.add_item(name, Label::Red, None, ItemKind::Solid(Solid { color, width: w, height: h, pixel_aspect: 1.0 }));
+            build::layer(p, comp, name, LayerSource::Solid { item: id }, (w, h), None)
+        };
+        let mut block = solid(&mut p, &comp, "Block", [1.0, 0.0, 0.0], (16, 8));
+        block.props.prop_mut("transform/position").unwrap().value = Value::Vec3([8.0, 44.0, 0.0]);
+        let mut bar = solid(&mut p, &comp, "Bar", [1.0, 1.0, 1.0], (8, 32));
+        bar.props.prop_mut("transform/position").unwrap().keys =
+            vec![Keyframe::new(Tick::ZERO, Value::Vec3([0.0, 16.0, 0.0])), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([64.0, 16.0, 0.0]))];
+        let mut masked = solid(&mut p, &comp, "Masked", [1.0, 1.0, 1.0], (64, 48));
+        let mut next = p.next_id;
+        let mut m = build::mask(&mut Ids(&mut next), "Mask 1", ShapePath::rect([10.0, 24.0], 8.0, 8.0), MaskMode::Add, [255, 0, 0]);
+        p.next_id = next;
+        m.get_mut("path").unwrap().keys = vec![
+            Keyframe::new(Tick::ZERO, Value::Path(ShapePath::rect([10.0, 24.0], 8.0, 8.0))),
+            Keyframe::new(Tick::from_seconds_f64(1.0), Value::Path(ShapePath::rect([54.0, 24.0], 8.0, 8.0))),
+        ];
+        masked.props.sub_mut("masks").unwrap().children.push(Node::Group(m));
+        comp.layers = vec![bar, block, masked];
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        (p, cid)
+    }
+
+    /// Export renders unchanged layers once per job (the layer cache) and every frame equals the
+    /// uncached render, frame by frame and in parallel batches.
+    #[test]
+    fn frames_reuse_unchanged_layers_and_match_uncached_renders() {
+        use effectcraft_project::render_queue::{OutputModule, RenderSettings};
+        let (p, cid) = three_layers();
+        let (settings, output) = (RenderSettings::default(), OutputModule::default());
+        let job = Job {
+            project: &p,
+            footage: &effectcraft_render::NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: "frame_#####.png",
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+        let cached = Cx::new(&job);
+        let uncached = Cx::new(&job);
+        // A zero budget keeps nothing: the reference renders every layer every frame.
+        uncached.cache.set_budget(0);
+        let comp = cached.comp().unwrap();
+        let n = 12u64;
+        for k in 0..n {
+            assert_eq!(cached.frame(comp, k).data, uncached.frame(comp, k).data, "frame {k}");
+        }
+        let (hit, miss) = (cached.cache.stats(), uncached.cache.stats());
+        // The block and the bar render once; the masked solid on every frame.
+        assert!(hit.hits >= 2 * (n - 1), "unchanged layers are reused: {hit:?}");
+        assert!(hit.misses >= n, "the masked solid changes every frame: {hit:?}");
+        assert_eq!(miss.entries, 0, "{miss:?}");
+        // Parallel batches (as the encoders render) share the cache and still match.
+        let par = effectcraft_render::passes::block_on(cached.frames(comp, (0..n).collect(), |_, img| img));
+        for (k, img) in par.iter().enumerate() {
+            assert_eq!(img.data, uncached.frame(comp, k as u64).data, "parallel frame {k}");
+        }
     }
 }
