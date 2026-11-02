@@ -49,6 +49,7 @@ pub mod ocio_config;
 pub mod paint;
 mod perspective;
 mod perspective2;
+mod pixel_sort;
 pub mod plugin;
 pub mod psim;
 pub mod puppet;
@@ -654,6 +655,7 @@ pub fn registry() -> &'static [EffectSpec] {
         v.extend(generate3::specs());
         v.extend(textfx::specs());
         v.extend(stylize3::specs());
+        v.extend(pixel_sort::specs());
         v.extend(transition2::specs());
         v.extend(channel2::specs());
         v.extend(keying2::specs());

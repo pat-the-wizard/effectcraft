@@ -1,6 +1,6 @@
 # Where EffectCraft falls short
 
-> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-11-02 · **Change:** minor (gap 7: 27 more original text animation presets, 35 in Animate In, Animate Out and Loops; earlier change: gap 4 closed: every pull request and push to `main` runs `cargo xtask ci` in CI, #2204; earlier change: gap 25: an AccessKit audit test and a theme contrast test, Effects & Presets, Settings and Render Queue named and keyboard-operable, #1335; earlier change: path-editing layer bounds, #1220; issue, PR and catalog references gap 21: percentage guides and effect colour labels in; earlier change: re-audited against `upstream/main` 470ea7a3; ranked gap list from the 10 October re-measure otherwise unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
+> **Last reviewed:** 2026-10-12 · **Last updated:** 2026-11-02 · **Change:** minor (G8: Stylize ▸ Pixel Sort, an original pixel-sorting effect; earlier change: gap 7: 27 more original text animation presets, 35 in Animate In, Animate Out and Loops; earlier change: gap 4 closed: every pull request and push to `main` runs `cargo xtask ci` in CI, #2204; earlier change: gap 25: an AccessKit audit test and a theme contrast test, Effects & Presets, Settings and Render Queue named and keyboard-operable, #1335; earlier change: path-editing layer bounds, #1220; issue, PR and catalog references gap 21: percentage guides and effect colour labels in; earlier change: re-audited against `upstream/main` 470ea7a3; ranked gap list from the 10 October re-measure otherwise unchanged) · **Target:** Adobe After Effects 2026 (26.5.0.89)
 
 An honest assessment of how far EffectCraft is from being a real replacement for After Effects,
 and the work that closes the gap. This document is meant for contributors and agents choosing
@@ -306,6 +306,9 @@ Issues #41–#47 (all from the Linux AppImage 0.1.1, 5 October): panning the vie
 - After Effects SDK plug-ins cannot run in EffectCraft. Our own WebAssembly plug-in API exists
   ([plugins.md](plugins.md)). Grow it: documentation, examples, and original effects that cover
   what the most common third-party plug-ins are used for (particles, glows, 3D objects, sabers).
+  First: Stylize ▸ Pixel Sort, the pixel-sorting glitch look (sort by luminance, hue, saturation,
+  lightness, a channel or at random; threshold spans at any angle; maximum and random span
+  length; gradient spans; feathered span edges; a constraint layer).
 - Features that come from third parties in After Effects are extensions in EffectCraft too, built
   on the same extension points as After Effects: scripts, ScriptUI panels and effect plug-ins
   ([plugins.md](plugins.md#extension-points-compared-with-after-effects) compares them). ScriptUI
