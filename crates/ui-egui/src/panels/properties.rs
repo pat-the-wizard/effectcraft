@@ -168,10 +168,19 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         if presp.clicked() {
             widgets::open_popup(ui, ppop);
         }
-        let presets = effectcraft_engine::text_presets();
-        let names: Vec<String> = presets.iter().map(|(_, n)| n.clone()).collect();
-        if let Some(i) = widgets::popup_menu(ui, ppop, pr.left_bottom(), &names, None) {
-            actions.push(("layer.applyTextPreset".into(), json!({"layer": layer.id.0, "preset": presets[i].0})));
+        // Animate In, Animate Out and Loops, with a separator between the groups.
+        let mut rows: Vec<(String, String)> = Vec::new();
+        let mut last_cat: Option<String> = None;
+        for (id, name, cat) in effectcraft_engine::text_preset_categories() {
+            if last_cat.as_ref().is_some_and(|c| *c != cat) {
+                rows.push(("-".into(), String::new()));
+            }
+            last_cat = Some(cat);
+            rows.push((name, id));
+        }
+        let names: Vec<String> = rows.iter().map(|(n, _)| n.clone()).collect();
+        if let Some((_, id)) = widgets::popup_menu(ui, ppop, pr.left_bottom(), &names, None).and_then(|i| rows.get(i)).filter(|(_, id)| !id.is_empty()) {
+            actions.push(("layer.applyTextPreset".into(), json!({"layer": layer.id.0, "preset": id})));
         }
         y += 24.0;
     }

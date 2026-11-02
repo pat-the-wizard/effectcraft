@@ -362,13 +362,16 @@ fn preset_row(
     auto_id: &str,
     query: &str,
     preset: PresetRef,
+    level: usize,
     apply: &mut Option<Apply>,
 ) {
     let t = app.tokens;
     let r = Rect::from_min_size(pos2(list.min.x, *y), vec2(list.width(), ROW_H));
     let id = egui::Id::unique(("fxpreset", auto_id));
     let tab = nav.tab_stop(id);
-    let selected = nav.push(id, *y, 3, None, Some(Apply::Preset(preset.clone())));
+    let selected = nav.push(id, *y, level, None, Some(Apply::Preset(preset.clone())));
+    // Rows in a sub-folder (Text ▸ Animate In) sit one folder step further in.
+    let dx = 14.0 * level.saturating_sub(3) as f32;
     *y += ROW_H;
     if r.max.y < list.min.y || r.min.y > list.max.y {
         return;
@@ -379,10 +382,10 @@ fn preset_row(
     } else if resp.hovered() {
         lp.rect_filled(r, 0.0, t.hover);
     }
-    icons::paint(lp, Rect::from_center_size(pos2(r.min.x + 58.0, r.center().y), vec2(12.0, 12.0)), Icon::Keyframe, t.text_dim);
-    highlighted(lp, pos2(r.min.x + 70.0, r.center().y), name, query, &t);
+    icons::paint(lp, Rect::from_center_size(pos2(r.min.x + 58.0 + dx, r.center().y), vec2(12.0, 12.0)), Icon::Keyframe, t.text_dim);
+    highlighted(lp, pos2(r.min.x + 70.0 + dx, r.center().y), name, query, &t);
     app.auto.add(auto_id, r, name);
-    a11y::tree_item(&resp, name, selected, 3, None);
+    a11y::tree_item(&resp, name, selected, level, None);
     row_focus(app, ui, lp, &resp, r, id);
     if resp.clicked() {
         nav_click(ui.ctx(), app, id);
@@ -392,6 +395,37 @@ fn preset_row(
     }
     if resp.double_clicked() {
         *apply = Some(Apply::Preset(preset));
+    }
+}
+
+/// Text ▸ Animate In / Animate Out / Loops: a folder per category (in menu order) with its
+/// presets, `text` being (id, name, category) already filtered by the search.
+#[allow(clippy::too_many_arguments)]
+fn text_preset_folders(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    lp: &egui::Painter,
+    list: Rect,
+    y: &mut f32,
+    nav: &mut Nav,
+    text: &[(String, String, String)],
+    query: &str,
+    searching: bool,
+    apply: &mut Option<Apply>,
+) {
+    let mut categories: Vec<&str> = Vec::new();
+    for (_, _, c) in text {
+        if !categories.contains(&c.as_str()) {
+            categories.push(c);
+        }
+    }
+    for cat in categories {
+        if !folder_row(app, ui, lp, list, y, nav, &format!("presets/Text/{cat}"), cat, 3, 28.0, searching, None) {
+            continue;
+        }
+        for (id, name, _) in text.iter().filter(|(_, _, c)| c == cat) {
+            preset_row(app, ui, lp, list, y, nav, name, &format!("effects.preset.text.{id}"), query, PresetRef::Text(id.clone()), 4, apply);
+        }
     }
 }
 
@@ -678,8 +712,8 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
 
     // * Animation Presets: our own presets (Text, Transitions…) and the user's .ecpreset files.
     if view.presets {
-        let text: Vec<(String, String)> =
-            effectcraft_engine::text_presets().into_iter().filter(|(_, n)| query.is_empty() || n.to_lowercase().contains(&query)).collect();
+        let text: Vec<(String, String, String)> =
+            effectcraft_engine::text_preset_categories().into_iter().filter(|(_, n, _)| query.is_empty() || n.to_lowercase().contains(&query)).collect();
         let builtin: Vec<(String, String, String)> =
             effectcraft_engine::animation_presets().into_iter().filter(|(_, n, _)| query.is_empty() || n.to_lowercase().contains(&query)).collect();
         let mut categories: Vec<&str> = Vec::new();
@@ -693,21 +727,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
         let any = !text.is_empty() || !builtin.is_empty() || !files.is_empty();
         if any && folder_row(app, ui, &lp, list, &mut y, &mut nav, "presets", "* Animation Presets", 1, 0.0, searching, None) {
             if !text.is_empty() && folder_row(app, ui, &lp, list, &mut y, &mut nav, "presets/Text", "Text", 2, 14.0, searching, None) {
-                for (id, name) in text {
-                    preset_row(
-                        app,
-                        ui,
-                        &lp,
-                        list,
-                        &mut y,
-                        &mut nav,
-                        &name,
-                        &format!("effects.preset.text.{id}"),
-                        &query,
-                        PresetRef::Text(id.clone()),
-                        &mut apply,
-                    );
-                }
+                text_preset_folders(app, ui, &lp, list, &mut y, &mut nav, &text, &query, searching, &mut apply);
             }
             for cat in &categories {
                 if !folder_row(app, ui, &lp, list, &mut y, &mut nav, &format!("presets/{cat}"), cat, 2, 14.0, searching, None) {
@@ -725,6 +745,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         &format!("effects.preset.builtin.{id}"),
                         &query,
                         PresetRef::Builtin(id.clone()),
+                        3,
                         &mut apply,
                     );
                 }
@@ -742,6 +763,7 @@ pub fn show(app: &mut EffectcraftApp, ui: &mut egui::Ui, rect: Rect) {
                         &format!("effects.preset.file.{}", f.name),
                         &query,
                         PresetRef::File(f.path.clone()),
+                        3,
                         &mut apply,
                     );
                 }

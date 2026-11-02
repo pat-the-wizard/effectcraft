@@ -267,6 +267,11 @@ pub fn text_preset_list() -> Vec<(String, String)> {
     text_anim::preset_names()
 }
 
+/// (id, name, category) of the text animation presets, grouped by category in menu order.
+pub fn text_preset_catalog() -> Vec<(String, String, String)> {
+    text_anim::preset_catalog()
+}
+
 /// (id, name, category) of the built-in animation presets (Transitions…).
 pub fn builtin_preset_list() -> Vec<(String, String, String)> {
     anim_presets::preset_names()
@@ -289,6 +294,12 @@ pub fn find(id: &str) -> Option<&'static CommandSpec> {
 /// Text animation presets: (id, name), for menus.
 pub fn text_presets() -> Vec<(String, String)> {
     commands::text_preset_list()
+}
+
+/// Text animation presets by category (Animate In, Animate Out, Loops): (id, name, category),
+/// grouped in menu order.
+pub fn text_preset_categories() -> Vec<(String, String, String)> {
+    commands::text_preset_catalog()
 }
 
 /// Built-in animation presets (Effects & Presets ▸ * Animation Presets): (id, name, category).

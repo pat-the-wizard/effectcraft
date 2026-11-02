@@ -128,7 +128,7 @@ fn presets_apply_render_and_round_trip() {
     let (mut s, t) = session();
     let list = s.execute("text.presets", json!({})).unwrap();
     let ids: Vec<String> = list.as_array().unwrap().iter().map(|p| p["id"].as_str().unwrap().to_string()).collect();
-    assert!(ids.len() >= 5 && ids.len() <= 8, "{ids:?}");
+    assert!(ids.len() >= 30, "{ids:?}");
     let cid = s.active_comp_id().unwrap();
     for id in &ids {
         let before = s.active_comp().unwrap().layers[0].props.group("text/animators").unwrap().children.len();
@@ -166,6 +166,7 @@ fn presets_apply_render_and_round_trip() {
 
 #[test]
 fn cached_text_presets_keep_the_catalog_and_application_independent() {
+    // The first eight presets keep their ids and names (menus and scripts name them).
     let expected = [
         ("typewriter", "Typewriter"),
         ("fadeUpCharacters", "Fade Up Characters"),
@@ -183,8 +184,9 @@ fn cached_text_presets_keep_the_catalog_and_application_independent() {
     let project = s.project.clone();
     for _ in 0..2 {
         let names = crate::text_presets();
-        assert_eq!(names.iter().map(|(id, name)| (id.as_str(), name.as_str())).collect::<Vec<_>>(), expected);
-        for (id, _) in expected {
+        assert_eq!(names.iter().take(expected.len()).map(|(id, name)| (id.as_str(), name.as_str())).collect::<Vec<_>>(), expected);
+        for (id, _) in &names {
+            let id = id.as_str();
             let result = s.execute("layer.applyTextPreset", json!({"layer": layer, "preset": id})).unwrap();
             assert!(!result["animators"].as_array().unwrap().is_empty(), "{id}");
             s.execute("edit.undo", json!({})).unwrap();
@@ -235,11 +237,20 @@ fn menus_have_text_animation_entries() {
     assert!(has(&["Animation", "Animate Text", "Enable Per-character 3D"], "layer.enablePerChar3D"));
     assert!(has(&["Animation", "Animate Text", "Fill Color", "Hue"], "layer.addTextAnimator"));
     assert!(has(&["Animation", "Add Text Selector", "Wiggly"], "text.addSelector"));
-    assert!(has(&["Animation", "Text Animation Presets", "Typewriter"], "layer.applyTextPreset"));
-    // Every preset in the menu exists.
+    assert!(has(&["Animation", "Text Animation Presets", "Animate In", "Typewriter"], "layer.applyTextPreset"));
+    assert!(has(&["Animation", "Text Animation Presets", "Animate Out", "Backspace"], "layer.applyTextPreset"));
+    assert!(has(&["Animation", "Text Animation Presets", "Loops", "Wave"], "layer.applyTextPreset"));
+    // Every preset in the menu exists, and every preset is in the menu under its category.
     let ids: Vec<String> = crate::text_presets().into_iter().map(|p| p.0).collect();
-    for (_, e) in entries.iter().filter(|(_, e)| e.command == "layer.applyTextPreset") {
+    let menu: Vec<_> = entries.iter().filter(|(_, e)| e.command == "layer.applyTextPreset").collect();
+    for (_, e) in &menu {
         assert!(ids.iter().any(|i| e.params["preset"] == i.as_str()), "{:?}", e.params);
+    }
+    for (id, name, cat) in crate::text_preset_categories() {
+        assert!(
+            menu.iter().any(|(p, e)| e.params["preset"] == id.as_str() && e.label == name && p.last().is_some_and(|c| *c == cat)),
+            "{id} is not in Text Animation Presets ▸ {cat}"
+        );
     }
     assert!(s.is_enabled("layer.enablePerChar3D"));
     assert!(!s.is_enabled("layer.addTextSelector"), "needs an animator");
@@ -267,4 +278,133 @@ fn duplicate_copies_selected_text_selector_not_the_layer() {
     s.execute("edit.duplicate", json!({})).unwrap();
     assert_eq!(s.active_comp().unwrap().layers.len(), 1);
     assert_eq!(anims(&s).groups().count(), 2, "the animator is copied");
+}
+
+/// The preset file's animators, in order, for preset `id`.
+fn preset_json(id: &str) -> serde_json::Value {
+    let v: serde_json::Value = serde_json::from_str(include_str!("../../presets/text_animators.json")).unwrap();
+    v["presets"].as_array().unwrap().iter().find(|p| p["id"] == id).unwrap().clone()
+}
+
+/// Every property path a preset names (animator properties, selector set / keys / expr) exists
+/// on what it builds and takes the value, keys or expression: a typo would otherwise be skipped
+/// silently and the preset would do less than it says.
+#[test]
+fn every_text_preset_path_resolves() {
+    let catalog = crate::text_preset_categories();
+    assert!(catalog.len() >= 30, "{}", catalog.len());
+    for (id, name, cat) in &catalog {
+        assert!(["Animate In", "Animate Out", "Loops"].contains(&cat.as_str()), "{id}: category {cat}");
+        let (mut s, t) = session();
+        s.execute("layer.applyTextPreset", json!({"layer": t, "preset": id})).unwrap_or_else(|e| panic!("{name}: {e}"));
+        let spec = preset_json(id);
+        let anims = text_group(&s).sub("animators").unwrap().clone();
+        let built: Vec<&PropGroup> = anims.groups().collect();
+        let want = spec["animators"].as_array().unwrap();
+        assert_eq!(built.len(), want.len(), "{id}");
+        for (a, g) in want.iter().zip(&built) {
+            let props = g.sub("properties").unwrap();
+            for m in a["properties"].as_object().unwrap().keys() {
+                assert!(props.prop(m).is_some(), "{id}: animator property {m}");
+            }
+            for m in a.get("keys").and_then(|k| k.as_object()).into_iter().flat_map(|k| k.keys()) {
+                assert!(!props.prop(m).unwrap().keys.is_empty(), "{id}: keys on {m}");
+            }
+            for m in a.get("expr").and_then(|k| k.as_object()).into_iter().flat_map(|k| k.keys()) {
+                assert!(props.prop(m).unwrap().expr.is_some(), "{id}: expression on {m}");
+            }
+            let sels: Vec<&PropGroup> = g.sub("selectors").unwrap().groups().collect();
+            let js = a["selectors"].as_array().unwrap();
+            // The animator's own Range Selector takes the first entry when it is a range.
+            let first = usize::from(js.first().is_none_or(|j| j["kind"].as_str().unwrap_or("range") != "range"));
+            assert_eq!(sels.len(), js.len() + first, "{id}: selectors");
+            for (j, sel) in js.iter().zip(sels.iter().skip(first)) {
+                let kind = j["kind"].as_str().unwrap_or("range");
+                assert_eq!(sel.match_id, format!("{kind}Selector"), "{id}");
+                for path in j.get("set").and_then(|k| k.as_object()).into_iter().flat_map(|k| k.keys()) {
+                    assert!(sel.prop(path).is_some(), "{id}: selector property {path}");
+                }
+                for path in j.get("keys").and_then(|k| k.as_object()).into_iter().flat_map(|k| k.keys()) {
+                    assert!(!sel.prop(path).unwrap().keys.is_empty(), "{id}: keys on {path}");
+                }
+                for path in j.get("expr").and_then(|k| k.as_object()).into_iter().flat_map(|k| k.keys()) {
+                    assert!(sel.prop(path).unwrap().expr.is_some(), "{id}: expression on {path}");
+                }
+            }
+        }
+    }
+}
+
+/// Animate In presets end on the untouched text and start hidden; Animate Out presets start on
+/// the untouched text and end hidden; Loops have no keyframes.
+#[test]
+fn text_presets_animate_in_out_and_loop() {
+    let opts = effectcraft_render::RenderOpts { scale: 0.5, ..Default::default() };
+    let at = effectcraft_time::Tick::from_seconds_f64;
+    let cov = |img: &effectcraft_render::Image| img.data.iter().map(|p| f64::from(p[3])).sum::<f64>();
+    let diff = |a: &effectcraft_render::Image, b: &effectcraft_render::Image| {
+        a.data.iter().zip(&b.data).map(|(p, q)| (0..4).map(|c| f64::from((p[c] - q[c]).abs())).sum::<f64>()).sum::<f64>() / a.data.len() as f64
+    };
+    let (base_s, _) = session();
+    let cid = base_s.active_comp_id().unwrap();
+    let flat = base_s.render(cid, at(0.0), opts);
+    // Presets that turn on Per-character 3D render through the 3D path: compare those with the
+    // untouched text in 3D.
+    let (mut base_3d, t3) = session();
+    base_3d.execute("layer.enablePerChar3D", json!({"layer": t3})).unwrap();
+    let deep = base_3d.render(cid, at(0.0), opts);
+    let full = cov(&flat);
+    assert!(full > 0.0);
+    for (id, _, cat) in crate::text_preset_categories() {
+        let base = if preset_json(&id)["perChar3d"] == true { &deep } else { &flat };
+        let (mut s, t) = session();
+        s.execute("layer.applyTextPreset", json!({"layer": t, "preset": id})).unwrap();
+        match cat.as_str() {
+            "Animate In" => {
+                let start = s.render(cid, at(0.0), opts);
+                let end = s.render(cid, at(3.5), opts);
+                assert!(diff(&end, base) < 1e-4, "{id}: ends on the text ({})", diff(&end, base));
+                assert!(diff(&start, base) > 1e-3, "{id}: starts animated");
+                // Scramble changes the letters, not their visibility.
+                if id != "scramble" {
+                    assert!(cov(&start) < 0.5 * full, "{id}: starts hidden ({} of {full})", cov(&start));
+                }
+            }
+            "Animate Out" => {
+                let start = s.render(cid, at(0.0), opts);
+                let end = s.render(cid, at(3.5), opts);
+                assert!(diff(&start, base) < 1e-4, "{id}: starts on the text ({})", diff(&start, base));
+                assert!(cov(&end) < 0.02 * full, "{id}: ends hidden ({} of {full})", cov(&end));
+            }
+            _ => {
+                // Loops move through expressions, which need the host's expression engine:
+                // `effectcraft-host`'s text_presets test checks that they keep moving.
+                // No keyframes: a loop runs for the layer's whole duration.
+                let anims = text_group(&s).sub("animators").unwrap().clone();
+                let mut keyed = Vec::new();
+                anims.walk("", &mut |path, p| {
+                    if !p.keys.is_empty() {
+                        keyed.push(path.to_string());
+                    }
+                });
+                assert!(keyed.is_empty(), "{id}: a loop has no keyframes ({keyed:?})");
+            }
+        }
+    }
+}
+
+/// Flip Up Characters turns on Per-character 3D (the layer becomes 3D and the animator gets X
+/// Rotation) in the same undo step as its animator.
+#[test]
+fn flip_up_turns_on_per_character_3d_in_one_undo_step() {
+    let (mut s, t) = session();
+    let before = s.project.clone();
+    s.execute("layer.applyTextPreset", json!({"layer": t, "preset": "Flip Up Characters"})).unwrap();
+    let l = s.active_comp().unwrap().layers[0].clone();
+    assert!(l.switches.three_d);
+    assert_eq!(l.props.prop("text/perChar3d").unwrap().value, KV::Bool(true));
+    let rx = l.props.prop("text/animators/#1/properties/rotationX").unwrap();
+    assert_eq!(rx.value, KV::Scalar(-90.0));
+    s.execute("edit.undo", json!({})).unwrap();
+    assert_eq!(*s.project, *before);
 }

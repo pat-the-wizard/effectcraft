@@ -25,6 +25,33 @@ pub fn preset_names() -> Vec<(String, String)> {
     presets().iter().filter_map(|p| Some((p.get("id")?.as_str()?.to_string(), p.get("name")?.as_str()?.to_string()))).collect()
 }
 
+/// The preset categories in menu order (Animate In, Animate Out, Loops).
+fn categories() -> &'static [String] {
+    static CATEGORIES: OnceLock<Vec<String>> = OnceLock::new();
+    CATEGORIES.get_or_init(|| {
+        serde_json::from_str::<Value>(PRESETS_JSON)
+            .ok()
+            .and_then(|v| v.get("categories").and_then(Value::as_array).map(|a| a.iter().filter_map(|c| c.as_str().map(str::to_string)).collect()))
+            .unwrap_or_default()
+    })
+}
+
+/// (id, name, category) of every preset, grouped by category in menu order (a preset without a
+/// known category goes last, under "Other"), in file order within a category.
+pub fn preset_catalog() -> Vec<(String, String, String)> {
+    let cats = categories();
+    let mut list: Vec<(usize, String, String, String)> = presets()
+        .iter()
+        .filter_map(|p| {
+            let cat = p.get("category").and_then(Value::as_str).unwrap_or("Other").to_string();
+            let rank = cats.iter().position(|c| *c == cat).unwrap_or(cats.len());
+            Some((rank, p.get("id")?.as_str()?.to_string(), p.get("name")?.as_str()?.to_string(), cat))
+        })
+        .collect();
+    list.sort_by_key(|e| e.0);
+    list.into_iter().map(|(_, id, name, cat)| (id, name, cat)).collect()
+}
+
 /// Enabled when a text layer is selected.
 fn has_text_layer(s: &Session) -> std::result::Result<(), String> {
     has_comp(s)?;
@@ -238,25 +265,30 @@ fn enable_per_char(s: &mut Session, p: &Value) -> Result<Value> {
         if !matches!(l.source, LayerSource::Text) {
             return Err(bad(C, "not a text layer"));
         }
-        if l.props.prop("text/perChar3d").is_none() {
-            let mut pc = ids.prop("perChar3d", "Per-character 3D", KV::Bool(false)).with_ui(effectcraft_project::ParamUi::Hidden);
-            pc.static_only = true;
-            if let Some(t) = l.props.sub_mut("text") {
-                t.children.insert(1, pc.into());
-            }
-        }
-        if let Some(pr) = l.props.prop_mut("text/perChar3d") {
-            pr.value = KV::Bool(on);
-        }
-        // Per-character 3D makes the layer 3D (as in AE).
-        if on {
-            l.switches.three_d = true;
-        }
-        set_animators_3d(&mut ids, l, on);
+        set_per_char(&mut ids, l, on);
         proj.next_id = next;
         Ok(())
     })?;
     Ok(json!({"perChar3d": on}))
+}
+
+/// Turn Per-character 3D on or off on a text layer: the switch, the layer's 3D switch (on makes
+/// the layer 3D, as in After Effects) and every animator's Z components and X / Y rotation.
+fn set_per_char(ids: &mut Ids, l: &mut Layer, on: bool) {
+    if l.props.prop("text/perChar3d").is_none() {
+        let mut pc = ids.prop("perChar3d", "Per-character 3D", KV::Bool(false)).with_ui(effectcraft_project::ParamUi::Hidden);
+        pc.static_only = true;
+        if let Some(t) = l.props.sub_mut("text") {
+            t.children.insert(1, pc.into());
+        }
+    }
+    if let Some(pr) = l.props.prop_mut("text/perChar3d") {
+        pr.value = KV::Bool(on);
+    }
+    if on {
+        l.switches.three_d = true;
+    }
+    set_animators_3d(ids, l, on);
 }
 
 /// JSON → property value shaped like `like`.
@@ -280,6 +312,29 @@ pub(super) fn json_value(v: &Value, like: &KV) -> Option<KV> {
         }
         _ => return None,
     })
+}
+
+/// Longest expression a preset may set (they are a line or two).
+const MAX_EXPR: usize = 4096;
+
+/// Put a preset's expression on the property at `path` under `g` (not on static properties).
+fn set_expr(g: &mut PropGroup, path: &str, text: &Value) {
+    let Some(body) = text.as_str().filter(|t| !t.trim().is_empty() && t.len() <= MAX_EXPR) else { return };
+    if let Some(pr) = g.prop_mut(path).filter(|pr| !pr.static_only) {
+        pr.expr = Some(effectcraft_project::Expression { text: body.to_string(), enabled: true });
+    }
+}
+
+/// The `layer.addTextAnimator` kind that adds the animator property `m`: X / Y Rotation come with
+/// Rotation (Per-character 3D), Skew Axis with Skew, Tracking Type with Tracking.
+fn kind_of(m: &str) -> &str {
+    match m {
+        "rotationX" | "rotationY" => "rotation",
+        "skewAxis" => "skew",
+        "trackingType" => "tracking",
+        "characterAlignment" | "characterRange" => "characterOffset",
+        other => other,
+    }
 }
 
 fn set_path(g: &mut PropGroup, path: &str, v: &Value, keys: Option<&Value>, at: Tick, ease: bool) {
@@ -314,11 +369,20 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
         .find(|x| x.get("id").and_then(Value::as_str) == Some(&want) || x.get("name").and_then(Value::as_str).is_some_and(|n| n.eq_ignore_ascii_case(&want)))
         .ok_or_else(|| bad(C, format!("no preset {want}")))?;
     let name = preset.get("name").and_then(Value::as_str).unwrap_or("Preset").to_string();
+    let per_char = preset.get("perChar3d").and_then(Value::as_bool).unwrap_or(false);
     let now = s.time();
     let uids = s.edit(&format!("Apply Text Preset {name}"), None, |proj, _| {
         let mut next = proj.next_id;
         let mut ids = Ids(&mut next);
         let l = layer_mut(proj, cid, lid)?;
+        if l.props.group("text/animators").is_none() {
+            return Err(bad(C, "not a text layer"));
+        }
+        // Presets that turn characters in depth (Flip Up) need Per-character 3D, in the same
+        // undo step as the animators.
+        if per_char && !per_char_on(l) {
+            set_per_char(&mut ids, l, true);
+        }
         let at = l.layer_time(now);
         let three = per_char_on(l);
         let anims_json = preset.get("animators").and_then(Value::as_array).cloned().unwrap_or_default();
@@ -330,11 +394,16 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
             let ease = a.get("ease").and_then(Value::as_bool).unwrap_or(false);
             if let Some(Value::Object(props)) = a.get("properties") {
                 for (m, v) in props {
-                    add_props(&mut ids, &mut g, m, three);
+                    add_props(&mut ids, &mut g, kind_of(m), three);
                     let keys = a.get("keys").and_then(|k| k.get(m));
                     if let Some(pg) = g.sub_mut("properties") {
                         set_path(pg, m, v, keys, at, ease);
                     }
+                }
+            }
+            if let (Some(Value::Object(exprs)), Some(pg)) = (a.get("expr"), g.sub_mut("properties")) {
+                for (m, text) in exprs {
+                    set_expr(pg, m, text);
                 }
             }
             for (i, sj) in a.get("selectors").and_then(Value::as_array).cloned().unwrap_or_default().iter().enumerate() {
@@ -366,6 +435,11 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
                         }
                     }
                 }
+                if let Some(Value::Object(exprs)) = sj.get("expr") {
+                    for (path, text) in exprs {
+                        set_expr(sel, path, text);
+                    }
+                }
             }
             uids.push(g.uid);
             anims.children.push(g.into());
@@ -377,7 +451,12 @@ fn apply_preset(s: &mut Session, p: &Value) -> Result<Value> {
 }
 
 fn list_presets(_: &mut Session, _: &Value) -> Result<Value> {
-    Ok(Value::Array(presets().iter().map(|p| json!({"id": p.get("id"), "name": p.get("name"), "description": p.get("description")})).collect()))
+    Ok(Value::Array(
+        presets()
+            .iter()
+            .map(|p| json!({"id": p.get("id"), "name": p.get("name"), "category": p.get("category"), "description": p.get("description")}))
+            .collect(),
+    ))
 }
 
 /// Animation ▸ Animate Text ▸ Variable Font Axes: the axes of the layer's font, or (with `axis`)
@@ -473,7 +552,7 @@ pub fn specs() -> Vec<CommandSpec> {
             "Apply Text Animation Preset",
             [],
             None,
-            "{layer?, preset: typewriter|fadeUpCharacters|bounceInWords|trackingIn|scramble|blurIn|jitter|dropInLines}",
+            "{layer?, preset: id or name (text.presets lists them: Animate In, Animate Out and Loops)}",
             has_text_layer,
             apply_preset
         ),

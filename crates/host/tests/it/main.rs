@@ -9,6 +9,7 @@ mod gif_animates;
 mod pick_whip;
 mod plugins;
 mod relink;
+mod text_presets;
 mod tga_import;
 mod timeline_interop;
 mod vector_import;

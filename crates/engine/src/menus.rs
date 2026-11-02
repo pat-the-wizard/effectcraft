@@ -1025,14 +1025,44 @@ Animation
     Clear Recent Presets | anim.clearRecentPresets
   Browse Presets... | anim.browsePresets
   Text Animation Presets
-    Typewriter | layer.applyTextPreset {"preset":"typewriter"}
-    Fade Up Characters | layer.applyTextPreset {"preset":"fadeUpCharacters"}
-    Bounce In Words | layer.applyTextPreset {"preset":"bounceInWords"}
-    Tracking In | layer.applyTextPreset {"preset":"trackingIn"}
-    Scramble | layer.applyTextPreset {"preset":"scramble"}
-    Blur In | layer.applyTextPreset {"preset":"blurIn"}
-    Jitter | layer.applyTextPreset {"preset":"jitter"}
-    Drop In Lines | layer.applyTextPreset {"preset":"dropInLines"}
+    Animate In
+      Typewriter | layer.applyTextPreset {"preset":"typewriter"}
+      Fade Up Characters | layer.applyTextPreset {"preset":"fadeUpCharacters"}
+      Bounce In Words | layer.applyTextPreset {"preset":"bounceInWords"}
+      Tracking In | layer.applyTextPreset {"preset":"trackingIn"}
+      Scramble | layer.applyTextPreset {"preset":"scramble"}
+      Blur In | layer.applyTextPreset {"preset":"blurIn"}
+      Drop In Lines | layer.applyTextPreset {"preset":"dropInLines"}
+      Fade In Words | layer.applyTextPreset {"preset":"fadeInWords"}
+      Rise Up Lines | layer.applyTextPreset {"preset":"riseUpLines"}
+      Pop In Characters | layer.applyTextPreset {"preset":"popInCharacters"}
+      Spin In Characters | layer.applyTextPreset {"preset":"spinInCharacters"}
+      Random Fade In | layer.applyTextPreset {"preset":"randomFadeIn"}
+      Slide In from Right | layer.applyTextPreset {"preset":"slideInFromRight"}
+      Zoom Down Characters | layer.applyTextPreset {"preset":"zoomDownCharacters"}
+      Flip Up Characters | layer.applyTextPreset {"preset":"flipUpCharacters"}
+      Skew In | layer.applyTextPreset {"preset":"skewIn"}
+      Fall In Characters | layer.applyTextPreset {"preset":"fallInCharacters"}
+    Animate Out
+      Fade Out Characters | layer.applyTextPreset {"preset":"fadeOutCharacters"}
+      Fall Away Characters | layer.applyTextPreset {"preset":"fallAwayCharacters"}
+      Backspace | layer.applyTextPreset {"preset":"backspace"}
+      Blur Out | layer.applyTextPreset {"preset":"blurOut"}
+      Tracking Out | layer.applyTextPreset {"preset":"trackingOut"}
+      Random Fade Out | layer.applyTextPreset {"preset":"randomFadeOut"}
+      Shrink Out Words | layer.applyTextPreset {"preset":"shrinkOutWords"}
+      Spin Out Characters | layer.applyTextPreset {"preset":"spinOutCharacters"}
+      Drop Out Lines | layer.applyTextPreset {"preset":"dropOutLines"}
+      Slide Out to Left | layer.applyTextPreset {"preset":"slideOutToLeft"}
+    Loops
+      Jitter | layer.applyTextPreset {"preset":"jitter"}
+      Wave | layer.applyTextPreset {"preset":"wave"}
+      Swing | layer.applyTextPreset {"preset":"swing"}
+      Color Wave | layer.applyTextPreset {"preset":"colorWave"}
+      Pulse Words | layer.applyTextPreset {"preset":"pulseWords"}
+      Highlight Sweep | layer.applyTextPreset {"preset":"highlightSweep"}
+      Neon Flicker | layer.applyTextPreset {"preset":"neonFlicker"}
+      Breathing Text | layer.applyTextPreset {"preset":"breathingText"}
   ---
   Add Keyframe | anim.addKeyframe
   Toggle Hold Keyframe | keys.toggleHold
