@@ -57,8 +57,15 @@ pub struct ExportResult {
 pub trait Exporter: Send + Sync {
     /// Formats this build can write.
     fn formats(&self) -> Vec<OutputFormat>;
+    /// Whether Skip Existing Files preserves sequence frames written by earlier items. Exporters
+    /// without an existence check (such as memory sinks) must keep the conservative default.
+    /// The check must cover the final destination for these settings, including any overflow.
+    fn supports_skip_existing(&self, _settings: &effectcraft_project::render_queue::RenderSettings) -> bool {
+        false
+    }
     /// Render and write one item (blocking). `progress(done, total)` returns `false` to cancel;
-    /// a cancelled export returns `Err("cancelled")`.
+    /// a cancelled export removes the files it opened for that output and returns `Err("cancelled")`.
+    /// Completed earlier queue items and unrelated files must be preserved.
     fn export(&self, job: &ExportJob, progress: &mut dyn FnMut(u64, u64) -> bool) -> Result<ExportResult, String>;
     /// [`Exporter::export`] as a future: renders whose GPU readbacks are deferred (a browser
     /// job worker's WebGPU device) await the device between a frame's passes. The default runs
@@ -109,7 +116,7 @@ pub struct JobShared {
 }
 
 pub(crate) fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
+    m.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
 impl JobShared {
@@ -156,6 +163,14 @@ struct Work {
     nested_switches: bool,
 }
 
+/// Where a relative render output goes when there is no default folder and the project is unsaved:
+/// `~/Movies` when it exists, else the home folder itself.
+pub(crate) fn default_output_base(home: Option<std::path::PathBuf>) -> Option<std::path::PathBuf> {
+    let home = home.filter(|h| !h.as_os_str().is_empty())?;
+    let movies = home.join("Movies");
+    Some(if movies.is_dir() { movies } else { home })
+}
+
 /// Bits per channel an output format writes for a project bit depth (named in the file when
 /// Settings ▸ Export ▸ Append Bit Depth to File Name is on).
 pub fn output_bits(format: OutputFormat, depth: effectcraft_project::BitDepth) -> u32 {
@@ -193,6 +208,21 @@ pub fn bytes_per_frame(om: &OutputModule, w: u32, h: u32, fps: f64) -> f64 {
                 P4444Xq => 500.0,
             };
             mbps(rate) * px / 29.97
+        }
+        // 24-bit RGB rows padded to even bytes, or 32-bit ARGB.
+        OutputFormat::Uncompressed => {
+            let bpp = if om.channels == effectcraft_project::render_queue::Channels::Rgba { 4 } else { 3 };
+            ((w as u64 * bpp).next_multiple_of(2) * h as u64) as f64
+        }
+        // An 18-byte header and 24-bit BGR, 32-bit BGRA or 8-bit grey (Alpha) pixels, uncompressed.
+        OutputFormat::TargaSequence => {
+            use effectcraft_project::render_queue::Channels;
+            let bpp = match om.channels {
+                Channels::Rgb => 3,
+                Channels::Rgba => 4,
+                Channels::Alpha => 1,
+            };
+            (18 + w as u64 * h as u64 * bpp) as f64
         }
         OutputFormat::WebM => mbps(8.0) * px / fps,
         OutputFormat::Gif => w as f64 * h as f64 * 0.5,
@@ -323,7 +353,7 @@ impl Session {
 
     /// The output path of a queue item: template tokens expanded, ending in the format's
     /// extension exactly once ([`OutputFormat::with_extension`]), relative paths resolved against
-    /// the project's folder (or the working directory). `None` when the comp is gone or the
+    /// the project's folder (an unsaved project's against ~/Movies or home). `None` when the comp is gone or the
     /// output is empty ("Needs Output").
     pub fn resolve_output(&self, item: &RenderQueueItem) -> Option<String> {
         let comp = self.project.comp(item.comp)?;
@@ -348,8 +378,19 @@ impl Session {
         // Settings ▸ Export ▸ Default Output Folder, else the project's folder.
         let folder = self.prefs.export.default_output_folder.trim();
         let base = (!folder.is_empty()).then(|| std::path::PathBuf::from(folder));
-        let base =
-            base.or_else(|| self.path.as_deref().and_then(|s| std::path::Path::new(s).parent().map(|d| d.to_path_buf())).filter(|d| !d.as_os_str().is_empty()));
+        // A project saved under a bare filename has the empty path as its parent. It sits in the
+        // working directory, so resolve against that rather than falling through to the
+        // unsaved-project default below (#1427).
+        let base = base.or_else(|| {
+            self.path
+                .as_deref()
+                .and_then(|s| std::path::Path::new(s).parent())
+                .map(|d| if d.as_os_str().is_empty() { std::path::PathBuf::from(".") } else { d.to_path_buf() })
+        });
+        // Unsaved project: ~/Movies, else the home folder (as FilmCraft's exports do). The working directory
+        // is `/` for an app started from the macOS Finder, where nothing can be written (#446).
+        let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")).map(std::path::PathBuf::from);
+        let base = base.or_else(|| default_output_base(home));
         // (the web has no working directory: relative outputs land in its virtual root)
         let base = base.or_else(|| std::env::current_dir().ok()).or_else(|| cfg!(target_arch = "wasm32").then(|| "/".into()))?;
         Some(base.join(path).to_string_lossy().to_string())
@@ -407,10 +448,46 @@ impl Session {
         self.render_job.as_ref().map(|j| j.shared.snapshot())
     }
 
-    /// Start rendering every queued item. `wait`: block until done (otherwise a background thread
-    /// renders, or the [`Session::offload`] worker; call [`Session::poll_render`] regularly).
-    /// Returns the ids being rendered. Without threads or an offload (wasm32) the render always
-    /// runs to completion before this returns.
+    /// The (item, resolved output path) of each output of `it`: one per output module and, with
+    /// Segment Sequences / Segment Movie Files, per segment. `formats`: the ones that can be
+    /// written (`None`: all). Fails with the status the item gets instead.
+    pub(crate) fn outputs_of(&self, it: &RenderQueueItem, formats: Option<&[OutputFormat]>) -> Result<Vec<(RenderQueueItem, String)>, RenderStatus> {
+        let mut modules = vec![];
+        for om in it.output_modules() {
+            let mut m = it.clone();
+            m.output = om.clone();
+            match self.resolve_output(&m) {
+                Some(p) if formats.is_none_or(|f| f.contains(&om.format)) => {
+                    // Settings ▸ Export: Append Bit Depth to File Name, Segment Sequences /
+                    // Movie Files.
+                    let bits = output_bits(om.format, self.project.settings.bit_depth);
+                    let p = self.prefs.output_name(&p, bits);
+                    modules.extend(self.segments(&m, &p));
+                }
+                Some(_) => return Err(RenderStatus::Failed(format!("{} export is not available", om.format.label()))),
+                None if self.project.comp(it.comp).is_none() => return Err(RenderStatus::Failed("composition missing".into())),
+                None => return Err(RenderStatus::NeedsOutput),
+            }
+        }
+        Ok(modules)
+    }
+
+    /// What the next Render would write: for each queued item its [`Session::outputs_of`], and
+    /// the status of each queued item that has none.
+    pub(crate) fn queued_outputs(&self, formats: &[OutputFormat]) -> (Vec<Vec<(RenderQueueItem, String)>>, Vec<(u64, RenderStatus)>) {
+        let (mut items, mut problems) = (Vec::new(), Vec::new());
+        for it in self.project.render_queue.iter().filter(|i| i.is_queued()) {
+            match self.outputs_of(it, Some(formats)) {
+                Ok(modules) => items.push(modules),
+                Err(status) => problems.push((it.id, status)),
+            }
+        }
+        (items, problems)
+    }
+
+    /// Start rendering every queued item, refusing outputs that replace footage, proxies or
+    /// the project file. Other existing outputs keep the exporter's usual replacement policy.
+    /// `wait`: block until done, otherwise render in the background and poll regularly.
     pub fn start_render(&mut self, wait: bool) -> Result<Vec<u64>, String> {
         let offload = self.offload.clone().filter(|_| !wait);
         let wait = wait || (cfg!(target_arch = "wasm32") && offload.is_none());
@@ -420,46 +497,38 @@ impl Session {
         self.poll_render();
         let exporter = self.exporter.clone().ok_or("export is not available in this build")?;
         let formats = exporter.formats();
-        let mut items = Vec::new();
-        let mut needs_output = Vec::new();
-        for it in self.project.render_queue.iter().filter(|i| i.is_queued()) {
-            let mut modules = vec![];
-            let mut problem = None;
-            for om in it.output_modules() {
-                let mut m = it.clone();
-                m.output = om.clone();
-                match self.resolve_output(&m) {
-                    Some(p) if formats.contains(&om.format) => {
-                        // Settings ▸ Export: Append Bit Depth to File Name, Segment Sequences /
-                        // Movie Files.
-                        let bits = output_bits(om.format, self.project.settings.bit_depth);
-                        let p = self.prefs.output_name(&p, bits);
-                        modules.extend(self.segments(&m, &p));
-                    }
-                    Some(_) => problem = Some(RenderStatus::Failed(format!("{} export is not available", om.format.label()))),
-                    None if self.project.comp(it.comp).is_none() => problem = Some(RenderStatus::Failed("composition missing".into())),
-                    None => problem = Some(RenderStatus::NeedsOutput),
-                }
-                if problem.is_some() {
-                    break;
-                }
-            }
-            match problem {
-                Some(st) => needs_output.push((it.id, st)),
-                None => items.push(modules),
-            }
+        let (mut items, mut problems) = self.queued_outputs(&formats);
+        let refused = self.check_outputs(&items);
+        // Two outputs of this job on one file: the render would replace its own output, so it is
+        // refused before anything is written (the items refused above take no part).
+        if let Some(refusal) = crate::output_guard::duplicate_refusal(&self.duplicate_outputs(&items, &refused)?) {
+            return Err(refusal);
         }
-        if !needs_output.is_empty() {
+        items.retain(|modules| modules.first().is_none_or(|(it, _)| !refused.iter().any(|r| r.item == it.id)));
+        problems.extend(refused.iter().map(|r| (r.item, RenderStatus::Failed(r.reason.clone()))));
+        if !problems.is_empty() {
             let p = Arc::make_mut(&mut self.project);
-            for (id, st) in needs_output {
+            for (id, st) in problems {
                 if let Some(i) = p.render_queue.iter_mut().find(|i| i.id == id) {
                     i.status = st;
                 }
             }
             self.bump();
         }
+        if let Some(first) = refused.first() {
+            let message = if refused.len() == 1 {
+                format!("Not rendered: {}", first.reason)
+            } else {
+                format!("{} items were not rendered; first: {}", refused.len(), first.reason)
+            };
+            self.events.push(Event::Toast { message, error: true });
+        }
         if items.is_empty() {
-            return Err("nothing is queued: add a composition (Composition ▸ Add to Render Queue) and tick Render".into());
+            return Err(match refused.as_slice() {
+                [] => "nothing is queued: add a composition (Composition ▸ Add to Render Queue) and tick Render".into(),
+                [only] => only.reason.clone(),
+                [first, ..] => format!("{} items would replace files the project reads; first: {}", refused.len(), first.reason),
+            });
         }
         let ids: Vec<u64> = items.iter().filter_map(|m| m.first().map(|(i, _)| i.id)).collect();
         if let Some(off) = offload {
@@ -496,7 +565,22 @@ impl Session {
             let sh = shared.clone();
             let thread = std::thread::Builder::new()
                 .name("render-queue".into())
-                .spawn(move || effectcraft_render::passes::block_on(run_work(work, &sh, &mut |_| {})))
+                .spawn(move || {
+                    let pending: Vec<u64> = work.items.iter().filter_map(|modules| modules.first().map(|(item, _)| item.id)).collect();
+                    if let Err(error) = crate::guard::guarded("render worker", || {
+                        effectcraft_render::passes::block_on(run_work(work, &sh, &mut |_| {}));
+                        Ok(())
+                    }) {
+                        let completed = lock(&sh.state).items_done;
+                        let mut updates = lock(&sh.updates);
+                        for id in pending.into_iter().skip(completed) {
+                            if !updates.iter().any(|u| matches!(u, ItemUpdate::Finished { id: done, .. } if *done == id)) {
+                                updates.push(ItemUpdate::Finished { id, status: RenderStatus::Failed(error.to_string()), seconds: 0.0, output: None });
+                            }
+                        }
+                        lock(&sh.state).finished = true;
+                    }
+                })
                 .map_err(|e| e.to_string())?;
             self.render_job = Some(RenderJob { shared, thread: Some(thread), remote: None });
         }
@@ -577,10 +661,17 @@ impl Session {
                 let _ = t.join();
             }
             let st = job.shared.snapshot();
-            let failed = updates.iter().filter(|u| matches!(u, ItemUpdate::Finished { status: RenderStatus::Failed(_), .. })).count();
+            let failures: Vec<&str> = updates
+                .iter()
+                .filter_map(|u| if let ItemUpdate::Finished { status: RenderStatus::Failed(e), .. } = u { Some(e.as_str()) } else { None })
+                .collect();
+            let failed = failures.len();
             let stopped = updates.iter().any(|u| matches!(u, ItemUpdate::Finished { status: RenderStatus::UserStopped, .. }));
-            let msg = if failed > 0 {
-                format!("Render finished with {failed} failed item(s)")
+            // The reason is otherwise only in the Status column's tooltip (#568).
+            let msg = if let [only] = failures.as_slice() {
+                format!("Render finished with 1 failed item(s): {only}")
+            } else if let Some(first) = failures.first() {
+                format!("Render finished with {failed} failed item(s), first: {first}")
             } else if stopped {
                 "Render stopped".to_string()
             } else {
@@ -608,8 +699,8 @@ impl Session {
         if item.post_render.is_none() {
             return Ok(None);
         }
-        let importer = self.importer.clone().ok_or("media import is not available in this build")?;
-        let footage = importer.probe(path)?;
+        // A rendered image sequence's first file brings the sequence.
+        let footage = self.probe_footage(path)?;
         if item.post_render == PostRenderAction::SetProxy {
             crate::commands::proxy_set(self, item.comp, footage).map_err(|e| e.to_string())?;
             self.toast(format!("Proxy set from {path}"));
@@ -629,7 +720,7 @@ impl Session {
                         continue;
                     }
                     if let Some(c) = proj.comp_mut(cid) {
-                        for l in c.layers.iter_mut().filter(|l| matches!(l.source, LayerSource::Comp { item } if item == comp)) {
+                        for l in c.layers.iter_mut_where(|l| matches!(l.source, LayerSource::Comp { item } if item == comp)) {
                             l.source = LayerSource::Footage { item: fid };
                         }
                     }

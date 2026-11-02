@@ -13,6 +13,7 @@
 //!
 //! Everything is dispatched to the `camera.*` commands.
 
+use crate::i18n::{tr, tr_args};
 use std::sync::Arc;
 
 use effectcraft_engine::Session;
@@ -214,15 +215,29 @@ pub fn viewer_hook(
         return;
     }
     // Interaction over the image.
-    let resp = ui.interact(map.area, egui::Id::new("viewer-camera-tracker"), Sense::click_and_drag());
+    // While Space (Hand tool) is held the overlay only hovers, so the viewer underneath gets the pan drag.
+    let sense = if super::space_hand(&ctx) { Sense::hover() } else { Sense::click_and_drag() };
+    let resp = ui.interact(map.area, egui::Id::unique("viewer-camera-tracker"), sense);
     app.auto.add("viewer.cameraTracker", map.area, "3D Camera Tracker points");
+    // The overlay is on top of the viewer, so a middle-button drag lands here: pan the viewer like the Hand tool.
+    if resp.dragged_by(egui::PointerButton::Middle) {
+        let pid = egui::Id::unique("viewer-camera-tracker-pan");
+        if resp.drag_started() {
+            let start_pan = app.ui.viewer.pan;
+            ui.data_mut(|d| d.insert_temp(pid, start_pan));
+        }
+        if let (Some(start_pan), Some(d)) = (ui.data(|m| m.get_temp::<[f32; 2]>(pid)), resp.total_drag_delta()) {
+            app.ui.viewer.pan = [start_pan[0] + d.x, start_pan[1] + d.y];
+        }
+        return;
+    }
     for (id, sp, r) in hits.iter().take(400) {
         app.auto.add(&format!("viewer.cameraTracker.point.{id}"), Rect::from_center_size(*sp, vec2(r * 2.0 + 4.0, r * 2.0 + 4.0)), "track point");
     }
     let hover = resp.hover_pos();
     let point_at = |p: Pos2| hits.iter().filter(|h| h.1.distance(p) <= h.2 + 3.0).min_by(|x, y| x.1.distance(p).total_cmp(&y.1.distance(p))).map(|h| h.0);
     let tri = hover.filter(|p| point_at(*p).is_none()).and_then(|p| triangle_at(&hits, p));
-    let mid = egui::Id::new("viewer-camera-tracker-marquee");
+    let mid = egui::Id::unique("viewer-camera-tracker-marquee");
     let marquee: Option<Pos2> = ui.data(|d| d.get_temp(mid));
     // Hover target / the selection's target.
     if marquee.is_none() {
@@ -269,7 +284,7 @@ pub fn viewer_hook(
         }
     }
     // Right-click: the points under the cursor (selection, else the hovered triangle).
-    let cid = egui::Id::new("viewer-camera-tracker-menu-points");
+    let cid = egui::Id::unique("viewer-camera-tracker-menu-points");
     if resp.secondary_clicked() {
         let pts: Vec<u32> = if !selected.is_empty() {
             selected.clone()
@@ -281,7 +296,7 @@ pub fn viewer_hook(
         ui.data_mut(|d| d.insert_temp(cid, pts));
     }
     let base = json!({"layer": a.layer.0, "effect": a.uid});
-    resp.context_menu(|ui| {
+    crate::widgets::context_menu(&resp, |ui| {
         let pts: Vec<u32> = ui.data(|d| d.get_temp(cid)).unwrap_or_default();
         let with = |kind: Option<&str>, multiple: bool| {
             let mut q = base.clone();
@@ -297,7 +312,7 @@ pub fn viewer_hook(
         let some = !pts.is_empty();
         let many = pts.len() > 1;
         let mut pick: Option<(&str, serde_json::Value)> = None;
-        if ui.add_enabled(some, egui::Button::new("Set Ground Plane and Origin")).clicked() {
+        if ui.add_enabled(some, egui::Button::new(tr("Set Ground Plane and Origin"))).clicked() {
             pick = Some(("camera.setGroundPlane", with(None, false)));
         }
         ui.separator();
@@ -320,7 +335,7 @@ pub fn viewer_hook(
             }
         }
         ui.separator();
-        if ui.add_enabled(some, egui::Button::new("Delete Selected Points")).clicked() {
+        if ui.add_enabled(some, egui::Button::new(tr("Delete Selected Points"))).clicked() {
             pick = Some(("camera.deletePoints", with(None, false)));
         }
         if let Some((cmd, q)) = pick {
@@ -398,12 +413,12 @@ pub fn editor(
     let b1 = Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + 4.0), vec2(84.0, 22.0));
     let b2 = Rect::from_min_size(pos2(b1.max.x + 8.0, b1.min.y), vec2(84.0, 22.0));
     let b3 = Rect::from_min_size(pos2(b2.max.x + 8.0, b1.min.y), vec2(110.0, 22.0));
-    if widgets::text_button(ui, b1, "Analyze", false, &t, egui::Id::new(("ct-analyze", g.uid))).clicked() && !busy {
+    if widgets::text_button(ui, b1, crate::i18n::tr("Analyze"), false, &t, egui::Id::unique(("ct-analyze", g.uid))).clicked() && !busy {
         actions.push(("camera.analyze".into(), me.clone()));
     }
     app.auto.add(&format!("effectControls.cameraTracker.{}.analyze", g.uid), b1, "Analyze");
     if running {
-        if widgets::text_button(ui, b2, "Cancel", false, &t, egui::Id::new(("ct-cancel", g.uid))).clicked() {
+        if widgets::text_button(ui, b2, crate::i18n::tr("Cancel"), false, &t, egui::Id::unique(("ct-cancel", g.uid))).clicked() {
             actions.push(("camera.cancel".into(), json!({})));
         }
         app.auto.add(&format!("effectControls.cameraTracker.{}.cancel", g.uid), b2, "Cancel");
@@ -411,15 +426,20 @@ pub fn editor(
     let params = effectcraft_engine::camera_track::static_params(g);
     let solve = ct::solve(&params);
     if solve.is_some() {
-        if widgets::text_button(ui, b3, "Create Camera", false, &t, egui::Id::new(("ct-camera", g.uid))).clicked() {
+        if widgets::text_button(ui, b3, crate::i18n::tr("Create Camera"), false, &t, egui::Id::unique(("ct-camera", g.uid))).clicked() {
             actions.push(("camera.create".into(), me.clone()));
         }
         app.auto.add(&format!("effectControls.cameraTracker.{}.createCamera", g.uid), b3, "Create Camera");
+        let export = Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + 70.0), vec2(218.0, 22.0));
+        if widgets::text_button(ui, export, tr("Export Scene to Blender..."), false, &t, egui::Id::unique(("ct-blender", g.uid))).clicked() && !busy {
+            actions.push(("camera.exportBlender".into(), me.clone()));
+        }
+        app.auto.add(&format!("effectControls.cameraTracker.{}.exportBlender", g.uid), export, "Export Scene to Blender...");
     }
     let status = match app.session.camera_progress() {
         Some(pr) if running => pr.banner(),
         _ => match &solve {
-            Some(sv) => format!("Method Used: {}    Average Error: {:.2} pixels", sv.method_used.label(), sv.average_error),
+            Some(sv) => tr_args("Method Used: {}    Average Error: {} pixels", &[&(sv.method_used.label()), &format!("{:.2}", sv.average_error)]),
             None if ct::tracks(&params).is_some() && app.session.camera_pending.iter().any(|(_, l, u)| *l == layer.id && *u == g.uid) => {
                 "Waiting to solve".into()
             }
@@ -442,4 +462,4 @@ pub fn editor(
 }
 
 /// Height of [`editor`].
-pub const EDITOR_HEIGHT: f32 = 68.0;
+pub const EDITOR_HEIGHT: f32 = 100.0;

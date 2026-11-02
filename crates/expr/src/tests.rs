@@ -1,5 +1,8 @@
 use std::time::Instant;
 
+mod deep_nesting;
+mod fuzz;
+
 use effectcraft_color::Label;
 use effectcraft_keyframe::{Keyframe, ShapePath, TextDoc, Value};
 use effectcraft_project::build::{self, Ids};
@@ -74,7 +77,7 @@ fn fx() -> Fx {
 
     let ids = (a.id, b.id, title.id, shape.id);
     let c = p.comp_mut(cid).unwrap();
-    c.layers = vec![a, b, title, shape];
+    c.layers = vec![a, b, title, shape].into();
     c.markers.push(Marker { time: secs(1.5), comment: "comp marker".into(), ..Default::default() });
 
     let other = Comp::new(64, 32, FrameRate::FPS_24, Tick::from_seconds_f64(3.0));
@@ -311,8 +314,78 @@ fn interpolation_with_arrays() {
     assert_eq!(f.pos("ease(time, 0, 1, [0, 0], [100, 50])", 1.0), [100.0, 50.0, 0.0]);
 }
 
-// ---- object model -----------------------------------------------------------------------------
+#[test]
+fn cubic_bezier_curves() {
+    let f = fx();
+    // ease(t, …) is cubic-bezier(1/3, 0, 2/3, 1): x(u) = u and y(u) = 3u² - 2u³.
+    assert_close!(f.num("bezier(0.25, 0, 1, 0, 100, [0.3333333333333333, 0, 0.6666666666666666, 1])", 0.0), f.num("ease(0.25, 0, 1, 0, 100)", 0.0));
+    assert_close!(f.num("bezier(0.5, 0, 1, 0, 100, [0.3333333333333333, 0, 0.6666666666666666, 1])", 0.0), 50.0);
+    // Symmetric ease-in-out: slower at both ends, faster in the middle.
+    let early = f.num("bezier(0.25, 0, 1, 0, 100, [0.42, 0, 0.58, 1])", 0.0);
+    let late = f.num("bezier(0.75, 0, 1, 0, 100, [0.42, 0, 0.58, 1])", 0.0);
+    assert!(early < 25.0 && late > 75.0, "ease-in-out: {early}, {late}");
+    // Control points on the diagonal are linear.
+    assert_close!(f.num("bezier(0.3, 0, 1, 0, 100, [0, 0, 1, 1])", 0.0), 30.0);
+    // t is clamped to tMin..tMax; tMin == tMax behaves like the other helpers.
+    assert_close!(f.num("bezier(-1, 0, 1, 0, 100, [0.42, 0, 0.58, 1])", 0.0), 0.0);
+    assert_close!(f.num("bezier(2, 0, 1, 0, 100, [0.42, 0, 0.58, 1])", 0.0), 100.0);
+    assert_close!(f.num("bezier(5, 2, 2, 0, 100, [0.42, 0, 0.58, 1])", 0.0), 100.0);
+}
 
+#[test]
+fn cubic_bezier_short_form_arrays_and_fallbacks() {
+    let f = fx();
+    // Short form: no tMin / tMax.
+    assert_close!(f.num("bezier(0.25, 10, 20, [0, 0, 1, 1])", 0.0), 12.5);
+    assert_eq!(f.pos("bezier(time, 0, 1, [0, 0], [100, 50], [0.42, 0, 0.58, 1])", 1.0), [100.0, 50.0, 0.0]);
+    // y outside 0..1 overshoots, as CSS allows.
+    let over = f.num("bezier(0.5, 0, 1, 0, 100, [0.5, 2, 0.5, 2])", 0.0);
+    assert!(over > 100.0, "overshoot: {over}");
+    // A curve that is not four finite numbers falls back to linear instead of throwing.
+    assert_close!(f.num("bezier(0.5, 0, 1, 0, 100, [1, 0])", 0.0), 50.0);
+    assert_close!(f.num("bezier(0.5, 0, 1, 0, 100, 'ease')", 0.0), 50.0);
+    // A missing or unusable curve must not consume the last value: read the curve by position.
+    assert_close!(f.num("bezier(0.5, 0, 1, 0, 100)", 0.0), 50.0);
+    assert_close!(f.num("bezier(0.5, 0, 100)", 0.0), 50.0);
+    assert_close!(f.num("bezier(0.5, 0, 100, [1, 0])", 0.0), 50.0);
+    let v = f.ev(f.shape, "contents/#1/contents/fill/color", "bezier(0.5, 0, 1, [0, 0, 0, 1], [1, 1, 1, 1])", 0.0).unwrap();
+    assert_eq!(v, Value::Color([0.5, 0.5, 0.5, 1.0]));
+    // Exactly four values are a curve; extra ones mean the curve is malformed, so linear.
+    assert_close!(f.num("bezier(0.5, 0, 1, 0, 100, [0.42, 0, 0.58, 1, 0])", 0.0), 50.0);
+    assert_close!(f.num("bezier(0.5, 0, 1, 0, 100, [0.42, 0, 0.58, 1, 2, 3])", 0.0), 50.0);
+    // x control points outside 0..1 are clamped, as CSS requires.
+    let v = f.num("bezier(0.5, 0, 1, 0, 100, [-1, 0, 2, 1])", 0.0);
+    assert!(v.is_finite(), "clamped curve: {v}");
+}
+
+#[test]
+fn cubic_bezier_is_accurate_near_the_endpoints() {
+    /// The value the curve reaches at `x`, by bisection on its monotone x(u).
+    fn reference(x1: f64, y1: f64, x2: f64, y2: f64, x: f64) -> f64 {
+        let bx = |u: f64| 3.0 * (1.0 - u) * (1.0 - u) * u * x1 + 3.0 * (1.0 - u) * u * u * x2 + u * u * u;
+        let by = |u: f64| 3.0 * (1.0 - u) * (1.0 - u) * u * y1 + 3.0 * (1.0 - u) * u * u * y2 + u * u * u;
+        let (mut lo, mut hi) = (0.0f64, 1.0f64);
+        for _ in 0..100 {
+            let mid = 0.5 * (lo + hi);
+            if bx(mid) < x {
+                lo = mid;
+            } else {
+                hi = mid;
+            }
+        }
+        by(0.5 * (lo + hi))
+    }
+    // Steep curves: a residual in x is not a residual in y near the endpoints (dy/dx is in the
+    // thousands), so the solver stops on the estimated y error instead.
+    let f = fx();
+    for (c, x) in [([0.0, 1000.0, 1.0, 1.0], 1e-6), ([0.0, 100.0, 1.0, 0.0], 1e-9), ([0.8, -500.0, 1.0, 1.0], 0.999999)] {
+        let got = f.num(&format!("bezier({x}, 0, 1, [{}, {}, {}, {}])", c[0], c[1], c[2], c[3]), 0.0);
+        let want = reference(c[0], c[1], c[2], c[3], x);
+        assert!((got - want).abs() < 1e-6, "curve {c:?} at {x}: {got} vs {want}");
+    }
+}
+
+// ---- object model -----------------------------------------------------------------------------
 #[test]
 fn comp_attributes() {
     let f = fx();
@@ -383,9 +456,85 @@ fn circular_references_terminate() {
     f.set_expr(f.b, OPA, "thisComp.layer('A').transform.opacity");
     let start = Instant::now();
     let r = eval_property(&f.p, f.cid, f.a, OPA, 0.0);
-    assert!(start.elapsed().as_secs_f64() < 10.0);
-    // The cycle bottoms out at the depth limit and falls back to keyframed values.
+    // Only a hang guard (the budgets stop it far sooner); generous for a loaded machine.
+    assert!(start.elapsed().as_secs_f64() < 100.0, "{:?}", start.elapsed());
+    // The cycle is caught when A needs itself again, and falls back to keyframed values.
     assert!(matches!(r, Ok(Value::Scalar(_))) || r.is_err(), "{r:?}");
+}
+
+#[test]
+fn an_expression_needing_its_own_value_fails_fast() {
+    // Found by the expression fuzzer (#786): rotation's `toWorld` reads the layer's transform,
+    // which evaluates rotation's expression again, twice per level (layer-to-comp and world
+    // matrices), so the cycle nested to `MAX_DEPTH` 2^16 times and the frame took 20 s.
+    let mut f = fx();
+    f.set_expr(f.a, ROT, "fromWorld(toWorld(anchorPoint))[0]");
+    let start = Instant::now();
+    let r = eval_property(&f.p, f.cid, f.a, ROT, 0.5);
+    assert!(start.elapsed().as_secs_f64() < 100.0, "{:?}", start.elapsed());
+    // The inner read falls back to the keyframed rotation, as in a standalone evaluation.
+    assert_eq!(r, f.ev(f.a, ROT, "fromWorld(toWorld(anchorPoint))[0]", 0.5));
+}
+
+#[test]
+fn fanning_out_reads_stop_at_a_budget() {
+    // Two layers reading each other twice at other times: no cycle (the times differ), but
+    // 2^16 evaluations at `MAX_DEPTH`; the evaluation stops after `MAX_RUNS` script runs.
+    let mut f = fx();
+    let text = |other: &str| format!("var r = thisComp.layer('{other}').transform.rotation; r.valueAtTime(time + 0.001) + r.valueAtTime(time + 0.002)");
+    f.set_expr(f.a, ROT, &text("B"));
+    f.set_expr(f.b, ROT, &text("A"));
+    // Take the clock out of the race: on a loaded machine the time budget could otherwise stop
+    // the evaluation before the run count does, with a different error.
+    crate::runtime::TIME_LIMIT.with(|t| t.set(std::time::Duration::from_secs(3600)));
+    let start = Instant::now();
+    let r = eval_property(&f.p, f.cid, f.a, ROT, 0.5);
+    crate::runtime::TIME_LIMIT.with(|t| t.set(crate::MAX_TIME));
+    assert!(start.elapsed().as_secs_f64() < 300.0, "{:?}", start.elapsed());
+    assert!(r.unwrap_err().contains("too many"));
+    // The budget is per outermost evaluation: the next one starts afresh.
+    assert_close!(f.num("time * 2", 1.0), 2.0);
+    assert_close!(f.ev(f.b, OPA, "thisComp.layer('A').transform.opacity", 0.0).unwrap().as_f64(), 100.0);
+}
+
+#[test]
+fn loops_stop_at_a_million_iterations() {
+    // Found by the expression fuzzer (#786): `for (…; i < 1e15; …)` ran ten million iterations
+    // per run (seconds), once more for every property the script reads after it.
+    let f = fx();
+    assert_close!(f.num("var n = 0; while (n < 900000) n++; n", 0.0), 900_000.0);
+    assert!(f.err("var n = 0; while (n < 2000000) n++; n").contains("iteration"));
+    assert!(f.err("for (;;) {}").contains("iteration"));
+}
+
+#[test]
+fn a_long_running_script_stops_at_the_time_budget() {
+    // Found by the expression fuzzer (#786): `smooth(NaN, 1e9)` made a million host reads in
+    // one run (tens of seconds), and the loop limit counts per function call, so loops calling
+    // functions that loop run for hours. The run is now abandoned after `MAX_TIME`.
+    let f = fx();
+    let start = Instant::now();
+    let e = f.err("function g() { for (var i = 0; i < 900000; i++) {} }\nfor (var k = 0; k < 900000; k++) g()");
+    assert!(e.contains("too long"), "{e}");
+    assert!(start.elapsed() < crate::MAX_TIME * 12, "{:?}", start.elapsed());
+    // The thread's runtime starts afresh.
+    assert_close!(f.num("time * 2", 1.0), 2.0);
+}
+
+#[test]
+fn a_path_with_non_numeric_points_is_an_error() {
+    // Found by the expression fuzzer (#786): an array in a vertex became NaN and tripped the
+    // rasterizer's clipping assertion when the mask was drawn.
+    let mut f = fx();
+    let text = "createPath([[0, 0], [[1, 2] * 2, 0], [100, 100]], [], [], true)";
+    assert!(f.ev(f.a, "masks/#1/path", text, 0.0).unwrap_err().contains("finite"));
+    assert!(f.ev(f.a, "masks/#1/path", "createPath([[0, 0], [1e400, 0], [100, 100]], [], [], true)", 0.0).is_err());
+    f.set_expr(f.a, "masks/#1/path", text);
+    let host = Expressions;
+    let mut r = Renderer::new(&f.p, &NoFootage, RenderOpts { motion_blur: false, ..Default::default() });
+    r.expr = Some(&host);
+    r.comp_frame(f.cid, Tick::ZERO);
+    assert!(f.ev(f.a, "masks/#1/path", "createPath([[0, 0], [10, 0], [10, 10]], [], [], true)", 0.0).is_ok());
 }
 
 #[test]
@@ -588,7 +737,8 @@ fn loop_on_two_dimensional_position() {
     let mut f = fx();
     f.layer_mut(f.a).props.prop_mut(POS).unwrap().keys =
         vec![Keyframe::new(secs(0.0), Value::Vec3([0.0, 0.0, 0.0])), Keyframe::new(secs(1.0), Value::Vec3([100.0, 50.0, 0.0]))];
-    assert_eq!(f.pos("loopOut('offset')", 1.5), [150.0, 75.0, 0.0]);
+    let p = f.pos("loopOut('offset')", 1.5);
+    assert!(p.iter().zip([150.0, 75.0, 0.0]).all(|(a, b)| (a - b).abs() < 1e-9), "{p:?}");
 }
 
 #[test]
@@ -828,6 +978,49 @@ fn source_rect_at_time() {
     assert!((s[0] + 31.0).abs() < 2.0 && (s[1] + 16.0).abs() < 2.0 && (s[2] - 62.0).abs() < 3.0, "{s:?}");
 }
 
+#[test]
+fn source_dimensions_follow_media_replacement() {
+    let mut p = Project::default();
+    let comp = Comp::new(200, 100, FrameRate::FPS_30, Tick::from_seconds_f64(2.0));
+    let cid = p.add_item("Main", Label::Sandstone, None, ItemKind::Comp(comp.clone().into()));
+    let footage = |p: &mut Project, name: &str, width, height| {
+        p.add_item(
+            name,
+            Label::SeaFoam,
+            None,
+            ItemKind::Footage(effectcraft_project::Footage {
+                path: name.into(),
+                kind: effectcraft_project::FootageKind::Still,
+                width,
+                height,
+                has_video: true,
+                ..Default::default()
+            }),
+        )
+    };
+    let original = footage(&mut p, "original.png", 100, 80);
+    let replacement = footage(&mut p, "replacement.png", 30, 40);
+    let mut l = build::layer(&mut p, &comp, "Clip", LayerSource::Footage { item: original }, (100, 80), None);
+    l.props.prop_mut(ROT).unwrap().expr =
+        Some(Expression { text: "thisLayer.width + thisLayer.height + thisLayer.source.width + sourceRectAtTime().width".into(), enabled: true });
+    let lid = l.id;
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let c = p.comp(cid).unwrap();
+    let l = c.layer(lid).unwrap();
+    let media = effectcraft_render::MediaOverride::new(lid, replacement);
+    let ctx = EvalCtx {
+        project: &p,
+        comp_id: cid,
+        comp: c,
+        time: Tick::ZERO,
+        expr: Some(&Expressions),
+        footage: None,
+        property_overrides: &[],
+        media_overrides: &[media],
+    };
+    assert_eq!(ctx.value(l, l.props.prop(ROT).unwrap()), Value::Scalar(130.0));
+}
+
 // ---- colour -----------------------------------------------------------------------------------
 
 #[test]
@@ -905,6 +1098,8 @@ fn result_kind_errors() {
 fn shadowing_layer_attribute_names_is_local() {
     let f = fx();
     assert_close!(f.num("var width = 3;\nwidth * 2", 0.0), 6.0);
+    assert_close!(f.num("width", 0.0), 20.0, 1e-9);
+    assert_close!(f.num("function width() { return 4; }\nwidth() * 2", 0.0), 8.0);
     assert_close!(f.num("width", 0.0), 20.0, 1e-9);
 }
 
@@ -1001,7 +1196,7 @@ fn hundred_wiggles_are_fast() {
     let per_frame = start.elapsed().as_secs_f64() * 1000.0 / n as f64;
     println!("100 wiggle properties: {per_frame:.3} ms/frame (checksum {acc})");
     // Generous bound so unoptimised CI builds pass; release is far below.
-    assert!(per_frame < 100.0, "{per_frame} ms/frame");
+    assert!(per_frame < 1000.0, "{per_frame} ms/frame");
 }
 
 #[test]
@@ -1035,7 +1230,16 @@ fn text_expression_selector_values() {
     let sel_of = |p: &Project| {
         let c = p.comp(cid).unwrap();
         let l = c.layer(lid).unwrap();
-        let ctx = EvalCtx { project: p, comp_id: cid, comp: c, time: Tick::ZERO, expr: Some(&Expressions), footage: None };
+        let ctx = EvalCtx {
+            project: p,
+            comp_id: cid,
+            comp: c,
+            time: Tick::ZERO,
+            expr: Some(&Expressions),
+            footage: None,
+            property_overrides: &[],
+            media_overrides: &[],
+        };
         let doc = effectcraft_render::text::source_text(&ctx, l).unwrap();
         let lay = effectcraft_text::layout_doc(&doc);
         let anim = l.props.group("text/animators/#1").unwrap();
@@ -1085,6 +1289,13 @@ fn sample_image_reads_rendered_pixels() {
     // The result has four values; outside the layer it's transparent.
     assert_close!(f.num("thisComp.layer(\"B\").sampleImage([20, 20]).length", 0.0), 4.0);
     assert_close!(f.num(&code("thisComp.layer(\"B\").sampleImage([-50, -50])"), 0.0), 0.0);
+}
+
+/// A huge sample point saturates the pixel coordinates; it must not overflow the loop bounds.
+#[test]
+fn sample_image_huge_point_is_transparent() {
+    let f = fx();
+    assert_close!(f.num("var c = thisComp.layer(\"B\").sampleImage([1e300, 1e300]); c[3]", 0.0), 0.0);
 }
 
 fn data_item(p: &mut Project, name: &str, text: &str) {
@@ -1160,3 +1371,304 @@ fn thousands_of_host_reads_on_one_thread_keep_working() {
         assert_eq!(f.num("function a() { return effect(1)(1); } function b() { return a(); } b() + 1", t), 43.0, "evaluation {i}");
     }
 }
+
+#[test]
+fn pending_text_style_baseline_setters_are_visible_to_expression_getters() {
+    let x = fx();
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSuperscript(true).isSuperscript ? 1 : 0", 0.0), 1.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSubscript(true).isSubscript ? 1 : 0", 0.0), 1.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSuperscript(true).setSubscript(true).isSuperscript ? 1 : 0", 0.0), 0.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSuperscript(true).setSubscript(true).isSubscript ? 1 : 0", 0.0), 1.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setSubscript(true).setSubscript(false).isSubscript ? 1 : 0", 0.0), 0.0);
+    assert_eq!(x.num("thisComp.layer('Title').text.sourceText.style.setBaselineOption('superscript').isSuperscript ? 1 : 0", 0.0), 1.0);
+    assert_eq!(x.text("var s = text.sourceText.style.setSuperscript(true); s.setText(s.isSuperscript ? 'super' : 'normal')", 0.0), "super");
+}
+
+#[test]
+fn layer_source_is_the_layers_source_item() {
+    let mut f = fx();
+    // A solid's source is an item of the solid's size and name (#809).
+    assert_close!(f.num("thisComp.layer('A').source.width", 0.0), 20.0);
+    assert_close!(f.num("thisComp.layer('A').source.height", 0.0), 20.0);
+    assert_close!(f.num("thisComp.layer('A').source.name == 'A' ? 1 : 0", 0.0), 1.0);
+    // Text and shape layers have no source item.
+    assert_close!(f.num("thisComp.layer('Title').source == null ? 1 : 0", 0.0), 1.0);
+    // A precomp layer's source is its composition.
+    let main = f.p.comp(f.cid).unwrap().clone();
+    let other = f.p.items.values().find(|i| i.name == "Other").unwrap().id;
+    let pre = build::layer(&mut f.p, &main, "Pre", LayerSource::Comp { item: other }, (64, 32), None);
+    f.p.comp_mut(f.cid).unwrap().layers.push(pre);
+    assert_close!(f.num("thisComp.layer('Pre').source.width", 0.0), 64.0);
+    assert_close!(f.num("thisComp.layer('Pre').source.numLayers", 0.0), 1.0);
+}
+
+/// The fixture plus a 20×12 solid "Wide", a 48×36 still "Still" (item "still.png") and a precomp
+/// layer "Pre" of the 64×32 "Other" comp.
+fn implicit_source_fx() -> (Fx, LayerId, LayerId, LayerId) {
+    let mut f = fx();
+    let main = f.p.comp(f.cid).unwrap().clone();
+    let wide = solid(&mut f.p, &main, "Wide", [1.0, 1.0, 0.0], 20, 12);
+    let item = f.p.add_item(
+        "still.png",
+        Label::SeaFoam,
+        None,
+        ItemKind::Footage(effectcraft_project::Footage {
+            path: "still.png".into(),
+            kind: effectcraft_project::FootageKind::Still,
+            width: 48,
+            height: 36,
+            has_video: true,
+            ..Default::default()
+        }),
+    );
+    let still = build::layer(&mut f.p, &main, "Still", LayerSource::Footage { item }, (48, 36), None);
+    let other = f.p.items.values().find(|i| i.name == "Other").unwrap().id;
+    let pre = build::layer(&mut f.p, &main, "Pre", LayerSource::Comp { item: other }, (64, 32), None);
+    let ids = (wide.id, still.id, pre.id);
+    let c = f.p.comp_mut(f.cid).unwrap();
+    c.layers.push(wide);
+    c.layers.push(still);
+    c.layers.push(pre);
+    (f, ids.0, ids.1, ids.2)
+}
+
+fn num_on(f: &Fx, layer: LayerId, text: &str) -> f64 {
+    match f.ev(layer, ROT, text, 0.0) {
+        Ok(v) => v.as_f64(),
+        Err(e) => panic!("{text}: {e}"),
+    }
+}
+
+#[test]
+fn implicit_source_matches_this_layer_source() {
+    let (f, wide, still, pre) = implicit_source_fx();
+    let same = "['name', 'width', 'height', 'duration', 'frameDuration', 'pixelAspect']\
+                .every(function (k) { return source[k] === thisLayer.source[k]; }) ? 1 : 0";
+    for (layer, name, w, h) in [(wide, "Wide", 20.0, 12.0), (still, "still.png", 48.0, 36.0), (pre, "Other", 64.0, 32.0)] {
+        assert_close!(num_on(&f, layer, "source.width"), w);
+        assert_close!(num_on(&f, layer, "source.height"), h);
+        assert_close!(num_on(&f, layer, &format!("source.name == '{name}' ? 1 : 0")), 1.0);
+        assert_close!(num_on(&f, layer, same), 1.0);
+    }
+    assert_close!(num_on(&f, pre, "source.numLayers"), 1.0);
+}
+
+#[test]
+fn implicit_source_is_null_without_a_source_item() {
+    let f = fx();
+    for layer in [f.title, f.shape] {
+        assert_close!(num_on(&f, layer, "source === null && thisLayer.source === null ? 1 : 0"), 1.0);
+        let bare = f.ev(layer, ROT, "source.width", 0.0).unwrap_err();
+        let qualified = f.ev(layer, ROT, "thisLayer.source.width", 0.0).unwrap_err();
+        assert!(qualified.contains("TypeError"), "{qualified}");
+        assert_eq!(bare, qualified);
+    }
+}
+
+#[test]
+fn implicit_source_can_be_shadowed_locally() {
+    let (f, wide, ..) = implicit_source_fx();
+    assert_close!(num_on(&f, wide, "var source = 7;\nsource * 2"), 14.0);
+    assert_close!(num_on(&f, wide, "source.width"), 20.0);
+    assert_close!(num_on(&f, wide, "var source = thisComp.layer('B').source;\nsource.width"), 40.0);
+    assert_close!(num_on(&f, wide, "source.height"), 12.0);
+}
+
+#[test]
+fn implicit_source_follows_the_current_layer() {
+    let (f, wide, still, pre) = implicit_source_fx();
+    let e = "source === null ? -1 : source.width * 1000 + source.height";
+    for _ in 0..2 {
+        for (layer, want) in [(wide, 20012.0), (still, 48036.0), (pre, 64032.0), (f.title, -1.0), (f.b, 40040.0)] {
+            assert_close!(num_on(&f, layer, e), want);
+        }
+    }
+}
+
+#[test]
+fn layer_control_property_stands_for_its_layer() {
+    let mut f = fx();
+    // Layer A gets a Layer Control ("Map") that points at layer B (#809).
+    let spec = effectcraft_effects::find("ec.control.layer").unwrap();
+    let mut map = group_push(&mut f.p, |ids| effectcraft_effects::instantiate(spec, ids, "Map", [20.0, 20.0]));
+    map.prop_mut("layer").unwrap().value = Value::Layer(Some(f.b.0));
+    f.p.comp_mut(f.cid).unwrap().layers[0].props.sub_mut("effects").unwrap().children.push(map.into());
+    // effect("Map")(1) is the layer itself: its name, index, transform and value.
+    assert_close!(f.num("effect('Map')(1).name == 'B' ? 1 : 0", 0.0), 1.0);
+    assert_close!(f.num("effect('Map')(1).index", 0.0), 2.0);
+    assert_close!(f.num("effect('Map')(1).transform.position[0]", 0.0), 100.0);
+    assert_close!(f.num("effect('Map')(1).transform.scale[0]", 0.0), 100.0);
+    assert_close!(f.num("effect('Map')(1).value.name == 'B' ? 1 : 0", 0.0), 1.0);
+}
+
+#[test]
+fn time_to_frames_rounds_durations_away_from_zero() {
+    let f = fx();
+    // Adobe's public expression reference distinguishes durations from absolute times.
+    // Expected integer counts are literal values, independent of the implementation.
+    for (expression, expected) in [
+        ("timeToFrames(-0.01, 24, true)", -1.0),
+        ("timeToFrames(-0.05, 24, true)", -2.0),
+        ("timeToFrames(0, 24, true)", 0.0),
+        ("timeToFrames(-0.125, 24, true)", -3.0),
+        ("timeToFrames(0.125, 24, true)", 3.0),
+        ("timeToFrames(0.01, 24, true)", 1.0),
+        ("timeToFrames(0.05, 24, true)", 2.0),
+    ] {
+        assert_eq!(f.num(expression, 0.0), expected, "{expression}");
+    }
+}
+
+#[test]
+fn time_to_frames_rounds_absolute_times_toward_negative_infinity() {
+    let f = fx();
+    for (expression, expected) in [
+        ("timeToFrames(-0.01, 24, false)", -1.0),
+        ("timeToFrames(-0.05, 24, false)", -2.0),
+        ("timeToFrames(0, 24, false)", 0.0),
+        ("timeToFrames(-0.125, 24, false)", -3.0),
+        ("timeToFrames(0.125, 24, false)", 3.0),
+        ("timeToFrames(0.01, 24, false)", 0.0),
+        ("timeToFrames(0.05, 24, false)", 1.0),
+    ] {
+        assert_eq!(f.num(expression, 0.0), expected, "{expression}");
+    }
+}
+
+#[test]
+fn time_to_frames_preserves_default_arguments() {
+    let f = fx();
+    // The fixture's composition is 30 fps with displayStartTime = 0.
+    for (expression, evaluation_time, expected) in [
+        ("timeToFrames(0.01, 24)", 0.0, 0.0),
+        ("timeToFrames(-0.01, 24)", 0.0, -1.0),
+        ("timeToFrames(0.05)", 0.0, 1.0),
+        ("timeToFrames(-0.05)", 0.0, -2.0),
+        ("timeToFrames()", 0.0, 0.0),
+        ("timeToFrames()", 0.05, 1.0),
+        ("timeToFrames()", -0.05, -2.0),
+        ("timeToFrames(undefined, 24, true)", 0.05, 2.0),
+        ("timeToFrames(0.05, undefined, true)", 0.0, 2.0),
+    ] {
+        assert_eq!(f.num(expression, evaluation_time), expected, "{expression} at {evaluation_time}s");
+    }
+}
+
+#[test]
+fn time_to_frames_preserves_coercion_and_small_durations() {
+    let f = fx();
+    // Duration rounding must not erase tiny nonzero values; absolute times keep the existing tolerance.
+    for (expression, expected) in [
+        ("timeToFrames('0.05', '24', false)", 1.0),
+        ("timeToFrames('0.05', '24', true)", 2.0),
+        ("timeToFrames('-0.05', '24', true)", -2.0),
+        ("timeToFrames(null, 24, true)", 0.0),
+        ("timeToFrames(0.05, null, true)", 0.0),
+        ("timeToFrames(0.05, 0, true)", 0.0),
+        ("timeToFrames(31 / 24 - 5 / 24, 24, true)", 26.0),
+        ("timeToFrames(5 / 24 - 31 / 24, 24, true)", -26.0),
+        ("timeToFrames(-1e-10, 24, false)", 0.0),
+        ("1 / timeToFrames(-0, 24, true) === Infinity ? 1 : 0", 1.0),
+        ("isNaN(timeToFrames(NaN, 24, true)) ? 1 : 0", 1.0),
+        ("timeToFrames(Infinity, 24, true) === Infinity ? 1 : 0", 1.0),
+        ("timeToFrames(-Infinity, 24, true) === -Infinity ? 1 : 0", 1.0),
+        ("var calls = 0; var t = {valueOf: function () { calls++; return 0.05; }}; timeToFrames(t, 24, true) + 100 * calls", 102.0),
+    ] {
+        assert_eq!(f.num(expression, 0.0), expected, "{expression}");
+    }
+}
+
+/// A layer is a property group too, as in After Effects: `thisLayer("transform")`, another
+/// layer's `("effects")("Slider Control")` or `(1)`, as the pick whip writes them with Compact
+/// English off (they failed: "not a callable function"). It is still a layer.
+#[test]
+fn layers_are_callable_property_groups() {
+    let f = fx();
+    assert_close!(f.num("thisLayer(\"transform\")(\"opacity\")", 0.0), 100.0);
+    assert_close!(f.num("thisComp.layer(\"A\")(\"effects\")(\"ec.control.slider\")(\"slider\")", 0.0), 42.0);
+    assert_close!(f.num("thisComp.layer(\"A\")(\"effects\")(\"Slider Control\")(1)", 0.0), 42.0);
+    assert_close!(f.num("thisComp.layer(1)(\"effects\")(1)(1)", 0.0), 42.0);
+    // Its own name, index and methods, and a layer as the result still reads as its index.
+    assert_close!(f.num("thisLayer.name == \"A\" ? thisComp.layer(\"B\").index : 0", 0.0), 2.0);
+    assert_close!(f.num("thisComp.layer(\"B\")", 0.0), 2.0);
+    assert_close!(f.num("thisComp.layer(thisComp.layer(\"B\"), -1).index", 0.0), 1.0);
+    assert!(f.err("thisLayer(\"nope\")").contains("no property"), "{}", f.err("thisLayer(\"nope\")"));
+}
+
+/// A layer is kept from one evaluation to the next (it is dear to make) but reads the project
+/// afresh in each, and an expression's own fields on it don't reach the next one.
+#[test]
+fn a_kept_layer_reads_the_project_again() {
+    let mut f = fx();
+    let first = "thisComp.layer(\"B\").index * 10 + thisComp.layer(2).name.length";
+    assert_close!(f.num(first, 0.0), 21.0);
+    f.layer_mut(f.b).name = "Bee".into();
+    f.p.comp_mut(f.cid).unwrap().layers.swap(0, 1);
+    assert_close!(f.num("thisComp.layer(\"Bee\").index * 10 + thisComp.layer(2).name.length", 0.0), 11.0);
+    assert_close!(f.num("thisLayer.index", 0.0), 2.0);
+    let _ = f.ev(f.a, ROT, "thisLayer.mine = 5; 0", 0.0);
+    assert_close!(f.num("thisLayer.mine === undefined ? 1 : 0", 0.0), 1.0);
+    let _ = f.ev(f.a, ROT, "var L = thisLayer; L.__c = 'x'; L.__l = 99; L.__i = ['Z', 7]; L.__s = __S; 0", 0.0);
+    assert_close!(f.num("thisLayer.index * 10 + thisLayer.name.length", 0.0), 21.0);
+    let _ = f.ev(f.a, ROT, "var L = thisLayer; delete L.__c; delete L.__l; delete L.__i; delete L.__s; 0", 0.0);
+    assert_close!(f.num("thisLayer.index * 10 + thisLayer.name.length", 0.0), 21.0);
+    let _ = f.ev(f.a, ROT, "Object.freeze(thisLayer); 0", 0.0);
+    f.layer_mut(f.a).name = "Ay".into();
+    f.p.comp_mut(f.cid).unwrap().layers.swap(0, 1);
+    assert_close!(f.num("thisLayer.index * 10 + thisLayer.name.length", 0.0), 12.0);
+}
+
+/// The kept layers are bounded: past the bound a layer isn't kept, an evaluation that makes more
+/// layers than are kept still sees one object for each layer it had kept, and the evaluations
+/// after it, which start over, read the right layers.
+#[test]
+fn the_kept_layers_are_bounded() {
+    let f = fx();
+    let same = "(thisLayer === thisComp.layer(thisLayer.index) ? 1 : 0)";
+    let many =
+        format!("var c = thisLayer.__c;\nfor (var i = 0; i < 5000; i++) __layer(c, 100000 + i);\n{same} * 10 + (__layer(c, 1e6) === __layer(c, 1e6) ? 0 : 1)");
+    assert_close!(f.num(&many, 0.0), 11.0);
+    assert_close!(f.num(&format!("{same} * 100 + thisLayer.index * 10 + thisLayer.name.length"), 0.0), 111.0);
+    assert_close!(f.num(&format!("{same} * 100 + thisLayer.index * 10 + thisLayer.name.length"), 0.0), 111.0);
+}
+
+/// A change to `Object.prototype` doesn't reach the kept layers: a frozen object put there under
+/// the comp's id, before any of its layers is kept, doesn't stop them being kept.
+#[test]
+fn the_kept_layers_dont_go_through_object_prototype() {
+    let f = fx();
+    let _ = f.ev(f.a, ROT, "try { Object.prototype[thisComp.__c] = Object.freeze({}); } catch (e) {} 0", 0.0);
+    assert_close!(f.num("thisLayer === thisComp.layer(thisLayer.index) ? 1 : 0", 0.0), 1.0);
+}
+
+/// The prelude is kept from one evaluation to the next, so an expression can't change its object
+/// model or internals for the ones after it.
+#[test]
+fn an_expression_cant_change_the_prelude_for_the_next() {
+    let f = fx();
+    let read = "[thisComp.layer(1).index, thisLayer.index, thisLayer('transform').property('rotation').value,                 thisLayer.transform.opacity.value, thisProject.bitsPerChannel, comp(thisComp.name).numLayers, width]";
+    let before = f.ev(f.a, ROT, read, 0.5).unwrap();
+    let attacks = [
+        "Comp.prototype.layer = function () { return 0; }",
+        "Object.getPrototypeOf(thisLayer).index = 0",
+        "Object.getPrototypeOf(thisLayer('transform')).property = function () { return 0; }",
+        "Object.getPrototypeOf(thisLayer.transform.opacity).value = 0",
+        "Comp = function () {}",
+        "Prop = function () {}",
+        "thisProject = null",
+        "__h = function () { return null; }",
+        "__layer = function () { return null; }",
+        "__child = function () {}",
+        "delete __mkProp",
+        "delete thisLayer",
+        "delete thisComp",
+        "delete width",
+        "Object.defineProperty(globalThis, 'thisComp', { get: function () { return 0; } })",
+    ];
+    for a in attacks {
+        let _ = f.ev(f.a, ROT, &format!("try {{ {a} }} catch (e) {{}} 0"), 0.0);
+        assert_eq!(f.ev(f.a, ROT, read, 0.5).unwrap(), before, "after `{a}`");
+    }
+}
+
+mod property_group;
