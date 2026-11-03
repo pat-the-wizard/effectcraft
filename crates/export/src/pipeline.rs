@@ -4,31 +4,177 @@
 
 use std::sync::Mutex;
 
-use effectcraft_project::render_queue::{
-    AlphaMode, Channels, ColorDepth, CurrentOrOff, EffectsMode, FrameSample, RenderLog, ResizeQuality, SwitchOverride, log_path,
-};
-use effectcraft_project::{Comp, Project};
+use effectcraft_project::render_queue::{AlphaMode, Channels, CurrentOrOff, EffectsMode, FrameSample, RenderLog, ResizeQuality, SwitchOverride, log_path};
+use effectcraft_project::{BitDepth, Comp, Project};
 use effectcraft_raster::Image;
-use effectcraft_render::{LayerCache, RenderOpts, Renderer};
+use effectcraft_render::{Backend, LayerCache, RenderOpts, Renderer};
 use effectcraft_time::Tick;
 use web_time::Instant;
 
 use crate::{Job, RenderQuality, out};
+
+/// GPU frames rendered at once by default: one, as the export scheduler's single GPU worker
+/// renders image sequences (#898: frames in flight beyond one only with asynchronous YUV
+/// readback). Measured on the #879 project at 1080p on an 8 GB card: 6.3 GB peak with one,
+/// 7.0 to 7.8 GB with two, and the whole card with three, where main fell back to the CPU.
+/// Not sized from free VRAM: the GPU backend reports no free or total device memory on every
+/// platform, so a portable estimate is not available here.
+pub(crate) const GPU_INFLIGHT_DEFAULT: usize = 1;
+/// Overrides [`GPU_INFLIGHT_DEFAULT`]: a whole number of frames, at least 1.
+pub(crate) const GPU_INFLIGHT_ENV: &str = "EFFECTCRAFT_GPU_INFLIGHT";
+
+/// GPU frames in flight from the `EFFECTCRAFT_GPU_INFLIGHT` value: a positive whole number, or
+/// the default (with a warning when a value was given) when it is 0, negative, not a number or
+/// too large.
+pub(crate) fn gpu_inflight(var: Option<&str>) -> usize {
+    let Some(v) = var else { return GPU_INFLIGHT_DEFAULT };
+    match v.trim().parse::<usize>() {
+        Ok(n) if n >= 1 => n,
+        _ => {
+            log::warn!(target: "effectcraft_export", "{GPU_INFLIGHT_ENV}={v:?} is not a whole number of frames of at least 1: using {GPU_INFLIGHT_DEFAULT}");
+            GPU_INFLIGHT_DEFAULT
+        }
+    }
+}
+
+/// Caps CPU frames in flight (#1615): a whole number of frames, at least 1. Unset, CPU renders
+/// keep one frame per thread in flight as before. A heavy comp can need gigabytes of working
+/// memory per frame, so 16 threads at once can get the process OOM-killed; the headless CLI
+/// reads no `memory.*` preferences, so this is how a render there is held to fewer frames.
+pub(crate) const CPU_INFLIGHT_ENV: &str = "EFFECTCRAFT_CPU_INFLIGHT";
+
+/// CPU frames in flight from the `EFFECTCRAFT_CPU_INFLIGHT` value: `None` (no cap) when unset or
+/// blank, a positive whole number, or `None` with a warning when it is 0, negative, not a
+/// number or too large.
+pub(crate) fn cpu_inflight(var: Option<&str>) -> Option<usize> {
+    let v = var?;
+    if v.trim().is_empty() {
+        return None;
+    }
+    match v.trim().parse::<usize>() {
+        Ok(n) if n >= 1 => Some(n),
+        _ => {
+            log::warn!(target: "effectcraft_export", "{CPU_INFLIGHT_ENV}={v:?} is not a whole number of frames of at least 1: CPU frames are not capped");
+            None
+        }
+    }
+}
+
+/// The frames-in-flight caps of a batch: `gpu` (#879) for the GPU's memory, `cpu` (#1615) for
+/// the process's.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Inflight {
+    pub gpu: Option<usize>,
+    pub cpu: Option<usize>,
+}
+
+impl Inflight {
+    /// Frames rendered at once: the smaller cap while the GPU renders, and only the CPU cap once
+    /// it has stopped for good (the CPU fallback renders in parallel, #1511). `None`: uncapped.
+    pub fn renders(&self, gpu_live: bool) -> Option<usize> {
+        let gpu = self.gpu.filter(|_| gpu_live);
+        let n = match (gpu, self.cpu) {
+            (Some(g), Some(c)) => Some(g.min(c)),
+            (g, c) => g.or(c),
+        };
+        n.map(|n| n.max(1))
+    }
+
+    /// Frames per window, rendered (`renders` at a time) and then encoded in parallel: with a CPU
+    /// cap at most that many, so finished images held before encoding count against it too;
+    /// with a GPU cap alone, one per thread (the images are in RAM, not VRAM).
+    pub fn window(&self, renders: usize) -> usize {
+        self.cpu.map_or(renders.max(rayon::current_num_threads()), |c| c.max(1))
+    }
+}
+
+/// `render` then `encode` over the frames `ks`, results in `ks` order.
+///
+/// Without `cap` every frame renders and encodes in one parallel batch (the CPU path, as
+/// before). With `cap` (GPU frames in flight), the frames go in windows of
+/// `max(cap, threads)`: each window renders in consecutive chunks of `cap` (at most `cap`
+/// renders at once), then encodes in parallel, so only the render is serialised and at most
+/// one window of rendered images is held in memory. Chunks hold no lock or slot, so a failing
+/// or panicking frame cannot leak one, and nested parallelism (or a single thread) cannot
+/// deadlock.
+#[cfg(test)]
+pub(crate) fn map_frames<I: Send, T: Send>(
+    ks: Vec<u64>,
+    cap: Option<usize>,
+    render: impl Fn(u64) -> I + Sync + Send,
+    encode: impl Fn(u64, I) -> T + Sync + Send,
+) -> Vec<T> {
+    map_frames_while(ks, Inflight { gpu: cap, cpu: None }, || true, render, encode)
+}
+
+/// [`map_frames`] with the caps of `caps`, the GPU cap holding only while `gpu_live()`: once it
+/// turns false (the GPU stopped for good, so every frame falls back to the CPU), the remaining
+/// frames render under the CPU cap alone, in parallel when there is none, instead of one chunk
+/// of the GPU cap at a time. A CPU cap also bounds each window ([`Inflight::window`]).
+pub(crate) fn map_frames_while<I: Send, T: Send>(
+    ks: Vec<u64>,
+    caps: Inflight,
+    gpu_live: impl Fn() -> bool,
+    render: impl Fn(u64) -> I + Sync + Send,
+    encode: impl Fn(u64, I) -> T + Sync + Send,
+) -> Vec<T> {
+    use rayon::prelude::*;
+    if caps.renders(gpu_live()).is_none() {
+        return ks.into_par_iter().map(|k| encode(k, render(k))).collect();
+    }
+    let mut out = Vec::with_capacity(ks.len());
+    let mut rest = &ks[..];
+    while !rest.is_empty() {
+        let Some(n) = caps.renders(gpu_live()) else {
+            out.par_extend(rest.par_iter().map(|&k| encode(k, render(k))));
+            break;
+        };
+        let (win, tail) = rest.split_at(caps.window(n).min(rest.len()));
+        let mut imgs = Vec::with_capacity(win.len());
+        let mut i = 0;
+        while i < win.len() {
+            let end = caps.renders(gpu_live()).map_or(win.len(), |n| (i + n).min(win.len()));
+            imgs.par_extend(win[i..end].par_iter().map(|&k| render(k)));
+            i = end;
+        }
+        out.par_extend(win.par_iter().copied().zip(imgs.into_par_iter()).map(|(k, img)| encode(k, img)));
+        rest = tail;
+    }
+    out
+}
+
+/// Threads that encode one batch of frames while the next renders ([`Cx::frames_beside`]).
+/// Their own pool: the encoder's parallel steps (colour conversion) would otherwise queue behind
+/// the render's work in the global pool. `None` where threads can't be started (a browser
+/// without them): encoding and rendering then take turns.
+pub(crate) struct Beside(Option<rayon::ThreadPool>);
+
+impl Beside {
+    fn new() -> Beside {
+        Beside(rayon::ThreadPoolBuilder::new().thread_name(|i| format!("export-encode-{i}")).build().ok())
+    }
+
+    /// The process's encode threads, started by the first movie export and shared by all.
+    pub fn shared() -> &'static Beside {
+        static SHARED: std::sync::OnceLock<Beside> = std::sync::OnceLock::new();
+        SHARED.get_or_init(Beside::new)
+    }
+}
 
 /// A job being exported: the job, the project with the Render Settings overrides applied, the
 /// job's layer cache and per-frame timing for the render log.
 pub(crate) struct Cx<'a> {
     pub job: &'a Job<'a>,
     pub project: Project,
-    /// Processed layer pixels shared by all of the job's frames, as the viewer's playback does:
-    /// a layer whose content doesn't change (static, or animated only in its transform) renders
-    /// once per job instead of once per frame. Keys hash the evaluated inputs, so every frame
-    /// equals an uncached render.
-    pub cache: LayerCache,
+    /// Processed layer buffers shared by the job's frames, as the viewer's layer cache: static
+    /// and transform-only layers render once per job (the GPU compositor then uploads them
+    /// once). Dropped with the job.
+    cache: LayerCache,
     /// (output frame, seconds) of every rendered frame (Plus Per Frame Info logs).
     pub frame_times: Option<Mutex<Vec<(u64, f64)>>>,
     /// Files written to an overflow folder.
     pub overflowed: Mutex<Vec<String>>,
+    written: Mutex<Vec<String>>,
 }
 
 impl<'a> std::ops::Deref for Cx<'a> {
@@ -72,27 +218,36 @@ impl<'a> Cx<'a> {
     pub fn new(job: &'a Job<'a>) -> Cx<'a> {
         let mut project = job.project.clone();
         apply_overrides(&mut project, job);
+        // Render Settings ▸ Color Depth overrides the project's depth for the whole render (every
+        // layer and effect quantises at it), not just the finished frame (#2022).
+        project.settings.bit_depth = job.settings.color_depth.resolve(project.settings.bit_depth);
         let frame_times = (job.options.log == RenderLog::PlusPerFrameInfo).then(|| Mutex::new(Vec::new()));
         let cache = LayerCache::default();
-        // Deferred GPU readbacks: pixels computed while a pass misses are placeholders.
+        // With deferred readbacks, buffers computed from a missed pass's placeholders are not kept.
         cache.set_gate(job.accel.and_then(|a| a.miss_gate()));
-        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]) }
+        Cx { job, project, cache, frame_times, overflowed: Mutex::new(vec![]), written: Mutex::new(vec![]) }
     }
 
     pub fn comp(&self) -> Option<&Comp> {
         self.project.comp(self.job.comp)
     }
 
-    async fn render_at(&self, t: Tick) -> Image {
+    /// The renderer of the job's frames: the Render Settings' options, the job's accelerator
+    /// and layer cache.
+    fn renderer(&self) -> Renderer<'_> {
         let s = self.job.settings;
+        // The whole job renders on the project's renderer (Mercury GPU Acceleration or Software
+        // Only), not on whichever compositor Auto timed faster for each frame: the CPU and GPU
+        // compositors differ slightly, so a per-frame choice made renders differ run to run.
+        let backend = if self.project.settings.gpu_acceleration { Backend::Gpu } else { Backend::Cpu };
         let opts = RenderOpts {
-            scale: s.resolution.clamp(0.01, 4.0),
+            scale: self.comp().map(|c| s.effective_scale(c)).unwrap_or_else(|| s.resolution.clamp(0.01, 4.0)),
             motion_blur: s.motion_blur_override() != SwitchOverride::OffForAll,
             guides: s.guide_layers == CurrentOrOff::Current,
             draft: s.quality == RenderQuality::Draft,
             // Output renders always look through the comp's active camera.
             view: None,
-            backend: effectcraft_render::Backend::Auto,
+            backend,
             roi: None,
             nested_switches: self.job.nested_switches,
             draft_shadows: true,
@@ -102,8 +257,12 @@ impl<'a> Cx<'a> {
         r.expr = self.job.expr;
         r.accel = self.job.accel;
         r.cache = Some(&self.cache);
+        r
+    }
+
+    async fn render_at(&self, t: Tick) -> Image {
         // With deferred GPU readbacks (a browser worker) the frame renders in passes.
-        effectcraft_render::passes::comp_frame(&r, self.job.comp, t).await
+        effectcraft_render::passes::comp_frame(&self.renderer(), self.job.comp, t).await
     }
 
     /// Whether frames render in passes (an accelerator with deferred readbacks).
@@ -122,8 +281,69 @@ impl<'a> Cx<'a> {
             }
             return out;
         }
-        use rayon::prelude::*;
-        ks.into_par_iter().map(|k| f(k, self.frame(comp, k))).collect()
+        // The GPU cap is for the GPU's memory: once it has stopped for good, frames render on the
+        // CPU, in parallel or under the CPU cap (#1615), which holds throughout.
+        let gpu_live = || self.job.accel.is_none_or(|a| a.available());
+        map_frames_while(ks, self.inflight(), gpu_live, |k| self.frame(comp, k), f)
+    }
+
+    /// [`Cx::frames`] for `ks` while `encode` runs beside them on `beside`'s threads, so the
+    /// render threads don't wait for the (largely sequential) encoder of the previous batch.
+    /// With deferred readbacks, or where no encode thread could be started, `encode` runs first.
+    #[cfg(test)]
+    pub async fn frames_beside<T: Send, A: Send>(
+        &self,
+        beside: &Beside,
+        comp: &Comp,
+        ks: Vec<u64>,
+        f: impl Fn(u64, Image) -> T + Sync + Send,
+        encode: impl FnOnce() -> A + Send,
+    ) -> crate::Result<(A, Vec<T>)> {
+        self.beside(beside, self.frames(comp, ks, f), encode).await
+    }
+
+    /// Run `encode` on `beside`'s threads while `frames` renders the next batch. With deferred
+    /// readbacks, or where no encode thread could be started, `encode` runs first.
+    pub async fn beside<T: Send, A: Send>(
+        &self,
+        beside: &Beside,
+        frames: impl std::future::Future<Output = Vec<T>>,
+        encode: impl FnOnce() -> A + Send,
+    ) -> crate::Result<(A, Vec<T>)> {
+        match &beside.0 {
+            Some(pool) if !self.deferred() => {
+                let mut done = None;
+                let frames = pool.in_place_scope(|s| {
+                    s.spawn(|_| done = Some(std::panic::catch_unwind(std::panic::AssertUnwindSafe(encode))));
+                    effectcraft_render::passes::block_on(frames)
+                });
+                match done {
+                    Some(Ok(a)) => Ok((a, frames)),
+                    Some(Err(panic)) => {
+                        let why = panic.downcast_ref::<&str>().map(|s| s.to_string()).or_else(|| panic.downcast_ref::<String>().cloned()).unwrap_or_default();
+                        Err(crate::ExportError::Encode(format!("the encoder stopped unexpectedly: {why}")))
+                    }
+                    None => Err(crate::ExportError::Encode("the encoder stopped unexpectedly".into())),
+                }
+            }
+            _ => {
+                let a = encode();
+                Ok((a, frames.await))
+            }
+        }
+    }
+
+    /// GPU frames rendered at once (#879), decided once per batch: with a GPU accelerator every
+    /// frame in flight holds its own working textures, so a whole batch rendered at once can
+    /// exhaust VRAM (or shared memory, which crashes instead of falling back). `None` when the
+    /// frames render on the CPU: no accelerator, or a Software Only project.
+    fn gpu_cap(&self) -> Option<usize> {
+        (self.job.accel.is_some() && self.project.settings.gpu_acceleration).then(|| gpu_inflight(std::env::var(GPU_INFLIGHT_ENV).ok().as_deref()))
+    }
+
+    /// The GPU and CPU frames-in-flight caps every frame loop shares (#1615).
+    fn inflight(&self) -> Inflight {
+        Inflight { gpu: self.gpu_cap(), cpu: cpu_inflight(std::env::var(CPU_INFLIGHT_ENV).ok().as_deref()) }
     }
 
     /// Output frame `i`: sampled (fields, pulldown), at the colour depth, cropped and resized.
@@ -141,31 +361,83 @@ impl<'a> Cx<'a> {
                 if second == first { a } else { interleave(&a, &self.render_at(second).await, upper_first) }
             }
         };
-        let mut img = img;
-        // Color Depth: renders run at the project's depth; another depth quantises the frame.
-        let depth = self.job.settings.color_depth;
-        if depth != ColorDepth::Current
-            && let Some(levels) = depth.resolve(self.project.settings.bit_depth).levels()
-        {
-            img.quantize(levels);
-        }
         let img = self.crop_resize(img);
+        if let Some(ft) = &self.frame_times {
+            ft.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((i, t0.elapsed().as_secs_f64()));
+        }
+        img
+    }
+
+    /// Output frame `i` as the H.264 export's 4:2:0 planes at `w`×`h`, rendered and converted
+    /// by the accelerator ([`effectcraft_render::Accelerator::comp_frame_yuv420`]). Only for
+    /// frames that need nothing done after the render (progressive, at the project's depth, no
+    /// crop or resize, rendered at exactly `w`×`h`). `None`: render it with [`Cx::frame`].
+    pub fn yuv420_frame(&self, comp: &Comp, i: u64, w: u32, h: u32) -> Option<Vec<u8>> {
+        if self.deferred() {
+            return None;
+        }
+        let FrameSample::Progressive(t) = self.job.settings.sample(comp, i) else { return None };
+        // Above 8 bpc the colour is dithered on its way to 8 bits (`Cx::pixels`), which the
+        // accelerator's conversion doesn't do: those frames render as usual so H.264 doesn't
+        // band (#2022). The project's depth already includes Render Settings ▸ Color Depth.
+        if self.project.settings.bit_depth != BitDepth::Bpc8 {
+            return None;
+        }
+        let om = self.job.output;
+        let scale = self.job.settings.effective_scale(comp);
+        let size = |n: u32| ((n as f64 * scale).round() as u32).max(1);
+        if om.resize.enabled || (size(comp.width), size(comp.height)) != (w, h) || om.crop.edges(w, h, scale) != (0, 0, 0, 0) {
+            return None;
+        }
+        let t0 = Instant::now();
+        let r = self.renderer();
+        let planes = r.active_accel()?.comp_frame_yuv420(&r, self.job.comp, t, comp.background)?;
+        let (cw, ch) = (w.div_ceil(2) as usize, h.div_ceil(2) as usize);
+        if planes.len() != w as usize * h as usize + 2 * cw * ch {
+            return None;
+        }
         if let Some(ft) = &self.frame_times {
             ft.lock().unwrap_or_else(|e| e.into_inner()).push((i, t0.elapsed().as_secs_f64()));
         }
-        img
+        Some(planes)
+    }
+
+    /// Output frames `ks` for the H.264 encoder: the accelerator's planes
+    /// ([`Cx::yuv420_frame`]) where it can, otherwise `fallback` of the frame rendered as usual.
+    pub(crate) fn h264_frames<T: Send>(
+        &self,
+        comp: &Comp,
+        ks: Vec<u64>,
+        w: u32,
+        h: u32,
+        planes: impl Fn(Vec<u8>) -> T + Sync + Send,
+        fallback: impl Fn(u64, Image) -> T + Sync + Send,
+    ) -> Vec<T> {
+        // As in `frames`: once the GPU has stopped for good, the rest render in parallel.
+        let gpu_live = || self.job.accel.is_none_or(|a| a.available());
+        map_frames_while(
+            ks,
+            self.inflight(),
+            gpu_live,
+            |k| self.yuv420_frame(comp, k, w, h).ok_or_else(|| self.frame(comp, k)),
+            |k, r| match r {
+                Ok(p) => planes(p),
+                Err(img) => fallback(k, img),
+            },
+        )
     }
 
     /// Output Module ▸ Crop, then Resize.
     fn crop_resize(&self, img: Image) -> Image {
         let om = self.job.output;
-        let scale = self.job.settings.resolution.clamp(0.01, 4.0);
+        let scale = self.comp().map(|c| self.job.settings.effective_scale(c)).unwrap_or_else(|| self.job.settings.resolution.clamp(0.01, 4.0));
+        // frame_size applies crop itself: use the original frame and the same scale as edges.
+        let (w, h) = om.frame_size(img.width, img.height, scale);
         let (t, l, b, r) = om.crop.edges(img.width, img.height, scale);
         let img = if (t, l, b, r) == (0, 0, 0, 0) { img } else { crop(&img, t, l, b, r) };
         if !om.resize.enabled {
             return img;
         }
-        let (w, h) = om.frame_size(img.width, img.height, 1.0);
         if (w, h) == (img.width, img.height) {
             return img;
         }
@@ -177,12 +449,24 @@ impl<'a> Cx<'a> {
 
     /// 8-bit RGBA of the requested channels cropped/padded to `w`×`h` (codec rounding): RGB over
     /// the comp background (opaque), RGB + Alpha straight or premultiplied, or the alpha matte.
+    /// When the render runs above 8 bpc, the colour is dithered on its way to 8 bits, as After
+    /// Effects dithers colours converted down to 8 bpc for rendering and export, so gradients
+    /// rendered at 16 or 32 bpc don't band (#2022). An 8 bpc render has no finer values to
+    /// dither, so its output stays byte for byte what it was.
     pub fn pixels(&self, img: &Image, comp: &Comp, channels: Channels, w: u32, h: u32) -> Vec<u8> {
+        let dither = self.project.settings.bit_depth != BitDepth::Bpc8;
+        self.pixels_with(img, comp, channels, w, h, dither)
+    }
+
+    /// [`Cx::pixels`], dithering the colour or not (a GIF palette gains nothing from dither noise).
+    pub fn pixels_with(&self, img: &Image, comp: &Comp, channels: Channels, w: u32, h: u32, dither: bool) -> Vec<u8> {
         let px = match channels {
+            Channels::Rgb if dither => img.to_rgba8_over_dithered(comp.background),
             Channels::Rgb => img.to_rgba8_over(comp.background),
-            Channels::Rgba => match self.job.output.alpha_mode {
-                AlphaMode::Straight => img.to_rgba8(),
-                AlphaMode::Premultiplied => premultiplied8(img),
+            Channels::Rgba => match (self.job.output.alpha_mode, dither) {
+                (AlphaMode::Straight, true) => img.to_rgba8_dithered(),
+                (AlphaMode::Straight, false) => img.to_rgba8(),
+                (AlphaMode::Premultiplied, _) => premultiplied8(img, dither),
             },
             Channels::Alpha => img
                 .data
@@ -196,6 +480,30 @@ impl<'a> Cx<'a> {
         crate::fit(px, img.width, img.height, w, h)
     }
 
+    /// Open a file and remember ownership for cancellation cleanup (including overflow paths).
+    pub fn create(&self, path: &str) -> crate::Result<out::Out<'_>> {
+        let file = out::create(self.sink, path)?;
+        if self.sink.is_none() {
+            self.written.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(path.to_owned());
+        }
+        Ok(file)
+    }
+
+    pub fn remove_cancelled_outputs(&self) -> crate::Result<()> {
+        let mut failure = None;
+        for path in self.written.lock().unwrap_or_else(std::sync::PoisonError::into_inner).iter() {
+            if let Err(e) = std::fs::remove_file(path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                failure.get_or_insert_with(|| crate::ExportError::Io(format!("cannot remove cancelled output {path}: {e}")));
+            }
+        }
+        match failure {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+
     /// Where a file goes: `path`, or (Use Storage Overflow) the first overflow folder with room
     /// for `bytes` when the quota hook says the output volume is full.
     pub fn place(&self, path: &str, bytes: u64) -> String {
@@ -207,7 +515,7 @@ impl<'a> Cx<'a> {
         for dir in &self.job.options.overflow {
             let p = std::path::Path::new(dir).join(&name).to_string_lossy().to_string();
             if q.has_room(&p, bytes) {
-                self.overflowed.lock().unwrap_or_else(|e| e.into_inner()).push(p.clone());
+                self.overflowed.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push(p.clone());
                 return p;
             }
         }
@@ -231,7 +539,7 @@ impl<'a> Cx<'a> {
             Ok(r) => s.push_str(&format!("Result: Done ({} frames, {}×{}, {} bytes) in {seconds:.2} s\n", r.frames, r.width, r.height, r.bytes)),
             Err(e) => s.push_str(&format!("Result: Failed\nError: {e}\n")),
         }
-        let over = self.overflowed.lock().unwrap_or_else(|e| e.into_inner());
+        let over = self.overflowed.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         if !over.is_empty() {
             s.push_str(&format!("Storage overflow: {} file(s) written to overflow folders (first: {})\n", over.len(), over[0]));
         }
@@ -246,7 +554,7 @@ impl<'a> Cx<'a> {
             }
         }
         if let (RenderLog::PlusPerFrameInfo, Some(ft), Some(c)) = (level, &self.frame_times, comp) {
-            let mut v = ft.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut v = ft.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
             v.sort_by_key(|(i, _)| *i);
             s.push_str("\nFrames:\n");
             let f0 = self.job.settings.first_frame(c);
@@ -255,7 +563,7 @@ impl<'a> Cx<'a> {
                 s.push_str(&format!("  Frame {} ({:.3} s): rendered in {:.1} ms\n", f0 + i as i64, t.seconds(), secs * 1000.0));
             }
         }
-        let mut f = out::create(self.job.sink, &path).ok()?;
+        let mut f = self.create(&path).ok()?;
         std::io::Write::write_all(&mut f, s.as_bytes()).ok()?;
         f.finish().ok()?;
         Some(path)
@@ -319,20 +627,429 @@ fn bicubic(src: &Image, w: u32, h: u32) -> Image {
     out
 }
 
-/// Premultiplied 8-bit RGBA (colour matted with black).
-fn premultiplied8(img: &Image) -> Vec<u8> {
-    img.data
-        .iter()
-        .flat_map(|p| {
-            let a = p[3].clamp(0.0, 1.0);
-            [0, 1, 2].map(|c| (p[c].clamp(0.0, a) * 255.0 + 0.5) as u8).into_iter().chain([(a * 255.0 + 0.5) as u8])
-        })
-        .collect()
+/// Premultiplied 8-bit RGBA (colour matted with black), the colour dithered when `dither`.
+fn premultiplied8(img: &Image, dither: bool) -> Vec<u8> {
+    let w = img.width.max(1) as usize;
+    let mut out = Vec::with_capacity(img.data.len() * 4);
+    for (i, p) in img.data.iter().enumerate() {
+        let a = p[3].clamp(0.0, 1.0);
+        let a8 = (a * 255.0 + 0.5) as u8;
+        let (x, y) = ((i % w) as u32, (i / w) as u32);
+        for c in 0..3 {
+            let v = p[c].clamp(0.0, a);
+            // Dither may round up past the rounded alpha; premultiplied colour never exceeds it.
+            out.push(if dither { effectcraft_raster::dither_u8(v, x, y).min(a8) } else { (v * 255.0 + 0.5) as u8 });
+        }
+        out.push(a8);
+    }
+    out
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    /// Dither may round a colour up while alpha rounds down; premultiplied colour stays at or
+    /// below the written alpha at every pixel.
+    #[test]
+    fn dithered_premultiplied_colour_never_exceeds_alpha() {
+        let v = 100.25 / 255.0;
+        let img = Image::filled(64, 64, [v, v, v, v]);
+        let px = premultiplied8(&img, true);
+        assert!(px.as_chunks::<4>().0.iter().all(|p| p[..3].iter().all(|c| *c <= p[3])), "a colour byte is above its alpha");
+        assert!(px.as_chunks::<4>().0.iter().all(|p| p[3] == 100));
+        let plain = premultiplied8(&img, false);
+        assert!(plain.as_chunks::<4>().0.iter().all(|p| *p == [100, 100, 100, 100]));
+    }
+
+    /// Frames `0..n` through [`map_frames`] with `cap`, recording the most running at once.
+    fn run_capped(n: u64, cap: Option<usize>) -> (Vec<u64>, usize) {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (now, max) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = map_frames(
+            (0..n).collect(),
+            cap,
+            |k| {
+                let c = now.fetch_add(1, Ordering::SeqCst) + 1;
+                max.fetch_max(c, Ordering::SeqCst);
+                std::thread::sleep(std::time::Duration::from_millis(2));
+                now.fetch_sub(1, Ordering::SeqCst);
+                k
+            },
+            |k, img| {
+                assert_eq!(k, img);
+                k * 10
+            },
+        );
+        (out, max.load(Ordering::SeqCst))
+    }
+
+    #[test]
+    fn frames_render_in_parallel_once_the_gpu_stops() {
+        // Every frame after the GPU stopped falls back to the CPU: the cap no longer applies.
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let (live, now, max) = (AtomicBool::new(true), AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = pool.install(|| {
+            map_frames_while(
+                (0..24).collect(),
+                Inflight { gpu: Some(1), cpu: None },
+                || live.load(Ordering::SeqCst),
+                |k| {
+                    if k == 1 {
+                        live.store(false, Ordering::SeqCst);
+                    }
+                    let c = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    if k >= 2 {
+                        max.fetch_max(c, Ordering::SeqCst);
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    k * 10
+                },
+                |_, v| v,
+            )
+        });
+        assert_eq!(out, (0..24).map(|k| k * 10).collect::<Vec<_>>());
+        assert!(max.load(Ordering::SeqCst) > 1, "frames after the GPU stopped ran one at a time");
+    }
+
+    #[test]
+    fn capped_frames_keep_their_order() {
+        let want: Vec<u64> = (0..40).map(|k| k * 10).collect();
+        for cap in [None, Some(1), Some(3), Some(7)] {
+            assert_eq!(run_capped(40, cap).0, want, "cap {cap:?}");
+        }
+    }
+
+    #[test]
+    fn gpu_frames_in_flight_respect_the_cap() {
+        // #879: every frame of a batch rendered on the GPU at once and exhausted VRAM.
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        pool.install(|| {
+            for cap in [1, 2, 3] {
+                let (out, max) = run_capped(30, Some(cap));
+                assert_eq!(out.len(), 30);
+                assert!(max <= cap, "cap {cap}: {max} frames ran at once");
+            }
+        });
+    }
+
+    #[test]
+    fn a_cap_above_the_frame_count_renders_them_all() {
+        let (out, max) = run_capped(2, Some(8));
+        assert_eq!(out, vec![0, 10]);
+        assert!(max <= 2);
+        assert!(run_capped(0, Some(3)).0.is_empty());
+    }
+
+    #[test]
+    fn cap_one_on_a_single_thread_does_not_deadlock() {
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+        let (out, max) = pool.install(|| run_capped(10, Some(1)));
+        assert_eq!(out.len(), 10);
+        assert_eq!(max, 1);
+        // Nested parallelism inside a frame (as the renderer has) on one thread.
+        let out = pool.install(|| map_frames((0..6).collect(), Some(2), |k| (0..4u64).into_par_iter().map(|i| i + k).sum::<u64>(), |_, v| v));
+        assert_eq!(out, (0..6).map(|k| 6 + 4 * k).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn a_failing_frame_does_not_hold_up_the_rest() {
+        let out = map_frames((0..9).collect(), Some(1), |k| if k == 3 { Err(k) } else { Ok(k) }, |_, r| r);
+        assert_eq!(out.iter().filter(|r| r.is_err()).count(), 1);
+        assert_eq!(out.len(), 9);
+        assert_eq!(out[8], Ok(8));
+        // A panicking frame propagates once and leaves no slot behind: the next batch runs.
+        let r = std::panic::catch_unwind(|| map_frames((0..6).collect(), Some(2), |k| if k == 2 { panic!("frame {k}") } else { k }, |_, k| k));
+        assert!(r.is_err());
+        assert_eq!(run_capped(6, Some(2)).0.len(), 6);
+    }
+
+    #[test]
+    fn encoding_is_not_capped_with_the_render() {
+        // Only the GPU render is serialised: a window of frames encodes in parallel.
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
+        let (now, max) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = pool.install(|| {
+            map_frames(
+                (0..8).collect(),
+                Some(1),
+                |k| k,
+                |k, _| {
+                    let c = now.fetch_add(1, Ordering::SeqCst) + 1;
+                    max.fetch_max(c, Ordering::SeqCst);
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    now.fetch_sub(1, Ordering::SeqCst);
+                    k
+                },
+            )
+        });
+        assert_eq!(out, (0..8).collect::<Vec<_>>());
+        assert!(max.load(Ordering::SeqCst) > 1, "encodes ran one at a time");
+    }
+
+    /// An accelerator that renders nothing itself (the tests only check whether frames are capped).
+    struct NoAccel;
+    impl effectcraft_render::Accelerator for NoAccel {
+        fn name(&self) -> String {
+            "none".into()
+        }
+        fn comp_frame(&self, _r: &Renderer, _comp: effectcraft_project::ItemId, _t: Tick) -> Option<Image> {
+            None
+        }
+        fn supports_effect(&self, _id: &str) -> bool {
+            false
+        }
+        fn effects(&self, _chain: &[effectcraft_render::FxStep], _buf: &effectcraft_effects::Buf, _levels: Option<f32>) -> Option<effectcraft_effects::Buf> {
+            None
+        }
+    }
+
+    #[test]
+    fn software_only_projects_are_not_capped() {
+        // Review of #879: an accelerator alone capped Software Only projects, which render on the CPU.
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_render::NoFootage;
+        let (settings, output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::PngSequence));
+        let accel = NoAccel;
+        for (gpu, want) in [(false, None), (true, Some(GPU_INFLIGHT_DEFAULT))] {
+            let mut p = Project::default();
+            p.settings.gpu_acceleration = gpu;
+            let job = Job {
+                project: &p,
+                footage: &NoFootage,
+                expr: None,
+                accel: Some(&accel),
+                comp: effectcraft_project::ItemId(0),
+                settings: &settings,
+                output: &output,
+                path: "/c/f_[#####].png",
+                sink: None,
+                nested_switches: true,
+                options: Default::default(),
+            };
+            if std::env::var_os(GPU_INFLIGHT_ENV).is_none() {
+                assert_eq!(Cx::new(&job).gpu_cap(), want, "gpu acceleration {gpu}");
+            } else {
+                assert_eq!(Cx::new(&job).gpu_cap().is_some(), gpu);
+            }
+        }
+        let p = Project::default();
+        let job = Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: effectcraft_project::ItemId(0),
+            settings: &settings,
+            output: &output,
+            path: "/c/f_[#####].png",
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+        assert_eq!(Cx::new(&job).gpu_cap(), None, "no accelerator");
+    }
+
+    #[test]
+    fn cpu_inflight_is_off_unless_a_positive_number() {
+        assert_eq!(cpu_inflight(None), None);
+        assert_eq!(cpu_inflight(Some("2")), Some(2));
+        assert_eq!(cpu_inflight(Some(" 4 ")), Some(4));
+        for bad in ["0", "", "  ", "-2", "three", "2.5", "99999999999999999999999"] {
+            assert_eq!(cpu_inflight(Some(bad)), None, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn cpu_cap_holds_and_combines_with_the_gpu_cap() {
+        // #1615: CPU renders had no cap; a GPU cap alone still lapses when the GPU stops.
+        let caps = |gpu, cpu| Inflight { gpu, cpu };
+        for live in [true, false] {
+            assert_eq!(caps(None, None).renders(live), None);
+            assert_eq!(caps(None, Some(2)).renders(live), Some(2));
+        }
+        assert_eq!(caps(Some(1), None).renders(true), Some(1));
+        assert_eq!(caps(Some(1), None).renders(false), None);
+        assert_eq!(caps(Some(3), Some(2)).renders(true), Some(2));
+        assert_eq!(caps(Some(1), Some(4)).renders(true), Some(1));
+        // Review of #1615: once the GPU stops, the CPU cap applies, not the GPU's 1.
+        assert_eq!(caps(Some(1), Some(4)).renders(false), Some(4));
+        // A CPU cap of 2 on 8 threads renders at most 2 frames at once.
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let (now, max) = (AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = pool.install(|| map_frames_while((0..16).collect(), caps(None, Some(2)), || true, |k| track(&now, &max, k), |_, k| k));
+        assert_eq!(out, (0..16).collect::<Vec<_>>());
+        assert!(max.load(Ordering::SeqCst) <= 2, "{max:?} frames in flight");
+    }
+
+    /// Counts `k` in flight in `now`, records the most in `max`, and holds it for a moment.
+    fn track(now: &AtomicUsize, max: &AtomicUsize, k: u64) -> u64 {
+        let c = now.fetch_add(1, Ordering::SeqCst) + 1;
+        max.fetch_max(c, Ordering::SeqCst);
+        std::thread::sleep(std::time::Duration::from_millis(5));
+        now.fetch_sub(1, Ordering::SeqCst);
+        k
+    }
+
+    #[test]
+    fn a_cpu_cap_bounds_the_images_waiting_to_encode() {
+        // Review of #1615: a window of one image per thread was rendered before any encoded, so
+        // a cap of 2 on 8 threads still held 8 finished images.
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        for gpu in [None, Some(1)] {
+            let (held, max) = (AtomicUsize::new(0), AtomicUsize::new(0));
+            let out = pool.install(|| {
+                map_frames_while(
+                    (0..20).collect(),
+                    Inflight { gpu, cpu: Some(2) },
+                    || true,
+                    |k| {
+                        let c = held.fetch_add(1, Ordering::SeqCst) + 1;
+                        max.fetch_max(c, Ordering::SeqCst);
+                        k
+                    },
+                    |k, img| {
+                        held.fetch_sub(1, Ordering::SeqCst);
+                        assert_eq!(k, img);
+                        k
+                    },
+                )
+            });
+            assert_eq!(out, (0..20).collect::<Vec<_>>());
+            assert!(max.load(Ordering::SeqCst) <= 2, "gpu {gpu:?}: {max:?} images held");
+        }
+    }
+
+    #[test]
+    fn the_cpu_cap_takes_over_once_the_gpu_stops() {
+        // Review of #1615: with both caps, frames after the GPU stopped rendered one at a time.
+        let pool = rayon::ThreadPoolBuilder::new().num_threads(8).build().unwrap();
+        let (live, now, max) = (AtomicBool::new(true), AtomicUsize::new(0), AtomicUsize::new(0));
+        let out = pool.install(|| {
+            map_frames_while(
+                (0..40).collect(),
+                Inflight { gpu: Some(1), cpu: Some(4) },
+                || live.load(Ordering::SeqCst),
+                |k| {
+                    if k == 1 {
+                        live.store(false, Ordering::SeqCst);
+                    }
+                    if k < 4 {
+                        return k;
+                    }
+                    track(&now, &max, k)
+                },
+                |_, k| k,
+            )
+        });
+        assert_eq!(out, (0..40).collect::<Vec<_>>());
+        let max = max.load(Ordering::SeqCst);
+        assert!((2..=4).contains(&max), "{max} frames in flight after the GPU stopped");
+    }
+
+    #[test]
+    fn gpu_inflight_override_is_a_positive_number_or_the_default() {
+        assert_eq!(gpu_inflight(None), GPU_INFLIGHT_DEFAULT);
+        assert_eq!(gpu_inflight(Some("3")), 3);
+        assert_eq!(gpu_inflight(Some(" 5 ")), 5);
+        for bad in ["0", "", "-2", "three", "2.5", "99999999999999999999999"] {
+            assert_eq!(gpu_inflight(Some(bad)), GPU_INFLIGHT_DEFAULT, "{bad:?}");
+        }
+    }
+
+    #[test]
+    fn layers_render_once_per_job() {
+        // #413: a job rendered every layer of every frame from scratch (no layer cache).
+        use effectcraft_color::Label;
+        use effectcraft_keyframe::{Keyframe, Value};
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_project::{ItemKind, LayerSource, Solid, build};
+        use effectcraft_render::NoFootage;
+        use effectcraft_time::FrameRate;
+        // A solid animated only in Transform: its pixels render once, then move.
+        let mut p = Project::default();
+        let mut comp = Comp::new(64, 48, FrameRate::FPS_25, Tick::from_seconds_f64(1.0));
+        let sid = p.add_item("Solid", Label::Red, None, ItemKind::Solid(Solid { color: [1.0, 0.0, 0.0], width: 16, height: 16, pixel_aspect: 1.0 }));
+        let mut l = build::layer(&mut p, &comp, "Solid", LayerSource::Solid { item: sid }, (16, 16), None);
+        l.props.prop_mut("transform/position").unwrap().keys =
+            vec![Keyframe::new(Tick::ZERO, Value::Vec3([8.0, 24.0, 0.0])), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([56.0, 24.0, 0.0]))];
+        comp.layers.push(l);
+        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
+        let (settings, output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::PngSequence));
+        let job = Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: "/c/f_[#####].png",
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+        let cx = Cx::new(&job);
+        let comp = cx.comp().unwrap();
+        cx.frame(comp, 0);
+        let renders = cx.cache.stats().misses;
+        assert!(renders > 0);
+        for i in 1..10 {
+            let img = cx.frame(comp, i);
+            // The frames are the ones rendered without a cache.
+            let t = settings.frame_time(comp, i);
+            let mut uncached = cx.renderer();
+            uncached.cache = None;
+            assert_eq!(img.data, uncached.comp_frame(cid, t).data, "frame {i}");
+        }
+        let stats = cx.cache.stats();
+        assert_eq!(stats.misses, renders, "the solid rendered on the first frame only");
+        assert!(stats.hits >= 9, "{stats:?}");
+    }
+
+    #[test]
+    fn frames_render_beside_the_encoder() {
+        use effectcraft_project::render_queue::{OutputFormat, OutputModule, RenderSettings};
+        use effectcraft_render::NoFootage;
+        use effectcraft_time::FrameRate;
+        let mut p = Project::default();
+        let comp = Comp::new(32, 16, FrameRate::FPS_25, Tick::from_seconds_f64(1.0));
+        let cid = p.add_item("Comp", effectcraft_color::Label::Sandstone, None, effectcraft_project::ItemKind::Comp(comp.into()));
+        let (settings, output) = (RenderSettings::default(), OutputModule::for_format(OutputFormat::H264));
+        let job = Job {
+            project: &p,
+            footage: &NoFootage,
+            expr: None,
+            accel: None,
+            comp: cid,
+            settings: &settings,
+            output: &output,
+            path: "/c/out.mp4",
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+        let cx = Cx::new(&job);
+        let comp = cx.comp().unwrap();
+        use effectcraft_render::passes::block_on;
+        let want = block_on(cx.frames(comp, (0..6).collect(), |k, img| (k, img.width, img.height)));
+        // On threads of their own, and taking turns (no threads): the same frames, in order.
+        for beside in [Beside::shared(), &Beside(None)] {
+            let (a, frames) = block_on(cx.frames_beside(beside, comp, (0..6).collect(), |k, img| (k, img.width, img.height), || 7)).unwrap();
+            assert_eq!((a, &frames), (7, &want));
+        }
+        // A panicking encoder fails the export instead of taking the render thread down.
+        let r = block_on(cx.frames_beside(Beside::shared(), comp, vec![0], |k, _| k, || -> u32 { panic!("encoder bug") }));
+        match r {
+            Err(crate::ExportError::Encode(e)) => assert!(e.contains("encoder bug"), "{e}"),
+            other => panic!("{:?}", other.map(|(a, f)| (a, f.len()))),
+        }
+    }
 
     #[test]
     fn interleave_takes_alternate_lines() {
@@ -343,6 +1060,91 @@ mod tests {
         for y in 0..4u32 {
             assert_eq!(up.data[up.idx(1, y)][0], if y % 2 == 0 { 1.0 } else { 0.0 }, "upper first: line {y}");
             assert_eq!(lo.data[lo.idx(1, y)][0], if y % 2 == 1 { 1.0 } else { 0.0 }, "lower first: line {y}");
+        }
+    }
+
+    /// Regress the locked-aspect example: cropping 1920x1080 must resize to 1280x1440.
+    #[test]
+    fn crop_resize_applies_margins_once() {
+        use effectcraft_project::render_queue::{Crop, OutputModule, Resize};
+        let output = OutputModule {
+            crop: Crop { enabled: true, left: 480, right: 480, ..Default::default() },
+            resize: Resize { enabled: true, width: 1280, lock_aspect: true, quality: ResizeQuality::Low, ..Default::default() },
+            ..Default::default()
+        };
+        assert_eq!(output.frame_size(1920, 1080, 1.0), (1280, 1440));
+        let img = run_crop_resize(Image::new(1920, 1080), &output, 1.0);
+        assert_eq!((img.width, img.height), (1280, 1440));
+        assert_eq!(img.data.len(), 1280 * 1440);
+    }
+
+    /// Apply output-module geometry to a synthetic frame without rendering or writing files.
+    fn run_crop_resize(img: Image, output: &effectcraft_project::render_queue::OutputModule, scale: f64) -> Image {
+        use effectcraft_project::render_queue::RenderSettings;
+        let project = Project::default();
+        let settings = RenderSettings { resolution: scale, ..Default::default() };
+        let job = Job {
+            project: &project,
+            footage: &effectcraft_render::NoFootage,
+            expr: None,
+            accel: None,
+            comp: effectcraft_project::ItemId(0),
+            settings: &settings,
+            output,
+            path: "unused.png",
+            sink: None,
+            nested_switches: true,
+            options: Default::default(),
+        };
+        Cx::new(&job).crop_resize(img)
+    }
+
+    /// Match predicted dimensions across crop, padding, ROI scale, aspect locks and resize qualities.
+    #[test]
+    fn crop_resize_dimensions_match_the_output_module() {
+        use effectcraft_project::render_queue::{Crop, OutputModule, Resize};
+        let edges = Crop { enabled: true, left: 2, right: 2, ..Default::default() };
+        let padding = Crop { enabled: true, left: -2, bottom: -2, ..Default::default() };
+        let roi = |rect| Crop { enabled: true, use_roi: true, roi: Some(rect), ..Default::default() };
+        for quality in [ResizeQuality::Low, ResizeQuality::High] {
+            let resize = |width| Resize { enabled: true, width, height: 1, lock_aspect: true, quality };
+            for (crop, resize, scale, expected) in [
+                (Crop::default(), Resize::default(), 1.0, (8, 6)),
+                (edges, Resize::default(), 1.0, (4, 6)),
+                (Crop::default(), resize(4), 1.0, (4, 3)),
+                (edges, resize(8), 1.0, (8, 12)),
+                (padding, resize(5), 1.0, (5, 4)),
+                (roi([4.0, 2.0, 8.0, 6.0]), resize(8), 0.5, (8, 6)),
+                (roi([1.0, 0.5, 2.0, 1.5]), resize(8), 2.0, (8, 6)),
+                (edges, Resize { lock_aspect: false, height: 2, ..resize(5) }, 1.0, (5, 2)),
+            ] {
+                let output = OutputModule { crop, resize, ..Default::default() };
+                assert_eq!(output.frame_size(8, 6, scale), expected);
+                let img = run_crop_resize(Image::filled(8, 6, [0.25, 0.0, 0.0, 0.5]), &output, scale);
+                assert_eq!((img.width, img.height), expected, "{crop:?}, {resize:?}, scale {scale}");
+                assert_eq!(img.data.len(), expected.0 as usize * expected.1 as usize);
+            }
+        }
+    }
+
+    /// Exercise zero/empty inputs, collapsed crops and existing caps on extreme single-axis resizes.
+    #[test]
+    fn crop_resize_zero_and_extreme_sizes_stay_bounded() {
+        use effectcraft_project::render_queue::{Crop, OutputModule, Resize};
+        for quality in [ResizeQuality::Low, ResizeQuality::High] {
+            for (size, crop, width, height, expected) in [
+                ((8, 6), Crop::default(), 0, 0, (1, 1)),
+                ((8, 1), Crop::default(), u32::MAX, 1, (30_000, 1)),
+                ((1, 8), Crop::default(), 1, u32::MAX, (1, 30_000)),
+                ((8, 6), Crop { enabled: true, left: 20_000, right: 20_000, ..Default::default() }, 2, 3, (2, 3)),
+                ((0, 0), Crop { enabled: true, left: 1, top: 1, ..Default::default() }, 2, 3, (2, 3)),
+            ] {
+                let output = OutputModule { crop, resize: Resize { enabled: true, width, height, lock_aspect: false, quality }, ..Default::default() };
+                let img = run_crop_resize(Image::new(size.0, size.1), &output, 1.0);
+                assert_eq!((img.width, img.height), expected);
+                assert_eq!(img.data.len(), expected.0 as usize * expected.1 as usize);
+                assert!(img.data.iter().all(|p| *p == [0.0; 4]));
+            }
         }
     }
 
@@ -360,79 +1162,5 @@ mod tests {
         assert_eq!(p.data[0], [0.0; 4]);
         assert_eq!(p.data[4][0], 0.0);
         assert_eq!(p.data[5][0], 1.0);
-    }
-
-    /// 64×48 at 30 fps: a static red block, a white bar sweeping left to right (animated only in
-    /// its transform) and a white solid whose mask path moves every frame (its content changes).
-    fn three_layers() -> (Project, effectcraft_project::ItemId) {
-        use effectcraft_color::Label;
-        use effectcraft_keyframe::{Keyframe, ShapePath, Value};
-        use effectcraft_project::build::{self, Ids};
-        use effectcraft_project::{ItemKind, LayerSource, MaskMode, Node, Solid};
-        use effectcraft_time::FrameRate;
-        let mut p = Project::default();
-        let mut comp = Comp::new(64, 48, FrameRate::FPS_30, Tick::from_seconds_f64(1.0));
-        let solid = |p: &mut Project, comp: &Comp, name: &str, color: [f32; 3], (w, h): (u32, u32)| {
-            let id = p.add_item(name, Label::Red, None, ItemKind::Solid(Solid { color, width: w, height: h, pixel_aspect: 1.0 }));
-            build::layer(p, comp, name, LayerSource::Solid { item: id }, (w, h), None)
-        };
-        let mut block = solid(&mut p, &comp, "Block", [1.0, 0.0, 0.0], (16, 8));
-        block.props.prop_mut("transform/position").unwrap().value = Value::Vec3([8.0, 44.0, 0.0]);
-        let mut bar = solid(&mut p, &comp, "Bar", [1.0, 1.0, 1.0], (8, 32));
-        bar.props.prop_mut("transform/position").unwrap().keys =
-            vec![Keyframe::new(Tick::ZERO, Value::Vec3([0.0, 16.0, 0.0])), Keyframe::new(Tick::from_seconds_f64(1.0), Value::Vec3([64.0, 16.0, 0.0]))];
-        let mut masked = solid(&mut p, &comp, "Masked", [1.0, 1.0, 1.0], (64, 48));
-        let mut next = p.next_id;
-        let mut m = build::mask(&mut Ids(&mut next), "Mask 1", ShapePath::rect([10.0, 24.0], 8.0, 8.0), MaskMode::Add, [255, 0, 0]);
-        p.next_id = next;
-        m.get_mut("path").unwrap().keys = vec![
-            Keyframe::new(Tick::ZERO, Value::Path(ShapePath::rect([10.0, 24.0], 8.0, 8.0))),
-            Keyframe::new(Tick::from_seconds_f64(1.0), Value::Path(ShapePath::rect([54.0, 24.0], 8.0, 8.0))),
-        ];
-        masked.props.sub_mut("masks").unwrap().children.push(Node::Group(m));
-        comp.layers = vec![bar, block, masked];
-        let cid = p.add_item("Comp", Label::Sandstone, None, ItemKind::Comp(comp.into()));
-        (p, cid)
-    }
-
-    /// Export renders unchanged layers once per job (the layer cache) and every frame equals the
-    /// uncached render, frame by frame and in parallel batches.
-    #[test]
-    fn frames_reuse_unchanged_layers_and_match_uncached_renders() {
-        use effectcraft_project::render_queue::{OutputModule, RenderSettings};
-        let (p, cid) = three_layers();
-        let (settings, output) = (RenderSettings::default(), OutputModule::default());
-        let job = Job {
-            project: &p,
-            footage: &effectcraft_render::NoFootage,
-            expr: None,
-            accel: None,
-            comp: cid,
-            settings: &settings,
-            output: &output,
-            path: "frame_#####.png",
-            sink: None,
-            nested_switches: true,
-            options: Default::default(),
-        };
-        let cached = Cx::new(&job);
-        let uncached = Cx::new(&job);
-        // A zero budget keeps nothing: the reference renders every layer every frame.
-        uncached.cache.set_budget(0);
-        let comp = cached.comp().unwrap();
-        let n = 12u64;
-        for k in 0..n {
-            assert_eq!(cached.frame(comp, k).data, uncached.frame(comp, k).data, "frame {k}");
-        }
-        let (hit, miss) = (cached.cache.stats(), uncached.cache.stats());
-        // The block and the bar render once; the masked solid on every frame.
-        assert!(hit.hits >= 2 * (n - 1), "unchanged layers are reused: {hit:?}");
-        assert!(hit.misses >= n, "the masked solid changes every frame: {hit:?}");
-        assert_eq!(miss.entries, 0, "{miss:?}");
-        // Parallel batches (as the encoders render) share the cache and still match.
-        let par = effectcraft_render::passes::block_on(cached.frames(comp, (0..n).collect(), |_, img| img));
-        for (k, img) in par.iter().enumerate() {
-            assert_eq!(img.data, uncached.frame(comp, k as u64).data, "parallel frame {k}");
-        }
     }
 }

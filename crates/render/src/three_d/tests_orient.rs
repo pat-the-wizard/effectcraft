@@ -8,6 +8,7 @@ use effectcraft_project::{AutoOrient, Comp, ItemId, ItemKind, Layer, LayerSource
 use effectcraft_time::{FrameRate, Tick};
 
 use super::active_camera;
+use super::camera::auto_orient_2d;
 use crate::EvalCtx;
 
 fn setup() -> (Project, ItemId, Comp) {
@@ -53,6 +54,92 @@ fn orient_along_path_2d_follows_motion() {
     let x_axis = ctx.world_matrix(&c.layers[0]).apply_vec(vec3(1.0, 0.0, 0.0));
     // Moving straight down (+y): the layer's x axis points down the screen.
     assert!(x_axis.x.abs() < 1e-6 && (x_axis.y - 1.0).abs() < 1e-6, "{x_axis:?}");
+}
+
+/// #1081: a layer travelling left kept its heading until the last keyframe, then (no motion left
+/// to measure) snapped back to 0 degrees and looked flipped. It must keep its last direction of
+/// travel at the final key and after it, in 2D and 3D.
+#[test]
+fn orient_along_path_keeps_the_last_heading_at_and_after_the_end() {
+    for three_d in [false, true] {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, three_d, [150.0, 50.0, 0.0]);
+        l.auto_orient = AutoOrient::AlongPath;
+        let end = Tick::from_seconds_f64(1.0);
+        l.props.prop_mut("transform/position").unwrap().keys =
+            vec![Keyframe::new(Tick::ZERO, Value::Vec3([150.0, 50.0, 0.0])), Keyframe::new(end, Value::Vec3([50.0, 50.0, 0.0]))];
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let c = p.comp(cid).unwrap();
+        for secs in [0.5, 0.999, 1.0, 1.2, 1.9] {
+            let ctx = EvalCtx::new(&p, cid, c, Tick::from_seconds_f64(secs));
+            let x_axis = ctx.world_matrix(&c.layers[0]).apply_vec(vec3(1.0, 0.0, 0.0));
+            // Moving left (-x): the layer's x axis keeps pointing left.
+            assert!((x_axis.x + 1.0).abs() < 1e-6 && x_axis.y.abs() < 1e-6 && x_axis.z.abs() < 1e-6, "3d={three_d} t={secs}: {x_axis:?}");
+        }
+    }
+}
+
+/// #1650: the same end-of-path flip when Position has no keyframes of its own and is driven by
+/// an expression (e.g. `pointOnPath()` fed by a keyframed slider on another layer): once the
+/// motion stops there are no Position keys to fall back on, and the heading snapped to 0 degrees.
+#[test]
+fn orient_along_path_keeps_the_last_heading_when_position_is_an_expression() {
+    /// Stand-in for an expression: holds, moves 100 px left over 0.5..1 s, then holds again (like
+    /// a slider going from 0% to 100%).
+    struct LeftThenHold;
+    impl crate::ExprHost for LeftThenHold {
+        fn eval(&self, ctx: &EvalCtx, _: &Layer, prop: &effectcraft_project::Property, value: &Value) -> Result<Value, String> {
+            if prop.match_id != "position" {
+                return Ok(value.clone());
+            }
+            let s = ((ctx.time.seconds() - 0.5) * 2.0).clamp(0.0, 1.0);
+            Ok(Value::Vec3([150.0 - 100.0 * s, 50.0, 0.0]))
+        }
+    }
+    for three_d in [false, true] {
+        let (mut p, cid, comp) = setup();
+        let mut l = solid(&mut p, &comp, three_d, [150.0, 50.0, 0.0]);
+        l.auto_orient = AutoOrient::AlongPath;
+        let pos = l.props.prop_mut("transform/position").unwrap();
+        assert!(pos.keys.is_empty(), "the fixture must have no Position keyframes");
+        pos.expr = Some(effectcraft_project::Expression { text: "left then hold".into(), enabled: true });
+        p.comp_mut(cid).unwrap().layers.push(l);
+        let c = p.comp(cid).unwrap();
+        for secs in [0.2, 0.75, 1.0, 1.0 + 1.0 / 30.0, 1.2, 1.9] {
+            let ctx = EvalCtx { expr: Some(&LeftThenHold), ..EvalCtx::new(&p, cid, c, Tick::from_seconds_f64(secs)) };
+            let x_axis = ctx.world_matrix(&c.layers[0]).apply_vec(vec3(1.0, 0.0, 0.0));
+            // Moving left (-x): the layer's x axis points left before the motion starts and after it stops.
+            assert!((x_axis.x + 1.0).abs() < 1e-6 && x_axis.y.abs() < 1e-6 && x_axis.z.abs() < 1e-6, "3d={three_d} t={secs}: {x_axis:?}");
+        }
+    }
+}
+
+/// #1650 on a curved path: the heading kept once an expression stops moving is the one at the end
+/// of the motion, the same on every later frame, not whatever earlier point a coarse search lands on.
+#[test]
+fn orient_along_a_curved_expression_path_keeps_the_end_heading() {
+    /// Quarter circle over 0..1 s: heading 0 degrees at the start, 90 degrees (down) at the end.
+    struct Arc;
+    impl crate::ExprHost for Arc {
+        fn eval(&self, ctx: &EvalCtx, _: &Layer, prop: &effectcraft_project::Property, value: &Value) -> Result<Value, String> {
+            if prop.match_id != "position" {
+                return Ok(value.clone());
+            }
+            let a = ctx.time.seconds().clamp(0.0, 1.0) * std::f64::consts::FRAC_PI_2;
+            Ok(Value::Vec3([100.0 * a.sin(), 100.0 - 100.0 * a.cos(), 0.0]))
+        }
+    }
+    let (mut p, cid, comp) = setup();
+    let mut l = solid(&mut p, &comp, false, [0.0, 0.0, 0.0]);
+    l.auto_orient = AutoOrient::AlongPath;
+    l.props.prop_mut("transform/position").unwrap().expr = Some(effectcraft_project::Expression { text: "arc".into(), enabled: true });
+    p.comp_mut(cid).unwrap().layers.push(l);
+    let c = p.comp(cid).unwrap();
+    for frame in [31, 33, 37, 45, 59] {
+        let ctx = EvalCtx { expr: Some(&Arc), ..EvalCtx::new(&p, cid, c, Tick::from_seconds_f64(frame as f64 / 30.0)) };
+        let deg = auto_orient_2d(&ctx, &c.layers[0]);
+        assert!((deg - 90.0).abs() < 0.5, "frame {frame}: {deg}");
+    }
 }
 
 #[test]

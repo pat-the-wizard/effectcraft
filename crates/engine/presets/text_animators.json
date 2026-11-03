@@ -1,10 +1,12 @@
 {
   "format": "effectcraft.textAnimatorPresets/1",
-  "notes": "Original EffectCraft text animator presets (MIT OR Apache-2.0). Key times are seconds from the current time; paths are relative to the selector.",
+  "notes": "Original EffectCraft text animator presets (MIT OR Apache-2.0). Key times are seconds from the current time; paths are relative to the selector. `category` groups the presets in menus (Animate In, Animate Out, Loops); `expr` puts an expression on an animator property or selector property; `perChar3d` turns on Per-character 3D first. Loops have no keyframes: expressions keep them running for the layer's whole duration.",
+  "categories": ["Animate In", "Animate Out", "Loops"],
   "presets": [
     {
       "id": "typewriter",
       "name": "Typewriter",
+      "category": "Animate In",
       "description": "Characters appear one at a time, hard-edged.",
       "animators": [
         {
@@ -23,6 +25,7 @@
     {
       "id": "fadeUpCharacters",
       "name": "Fade Up Characters",
+      "category": "Animate In",
       "description": "Characters fade in while rising into place, left to right.",
       "animators": [
         {
@@ -42,6 +45,7 @@
     {
       "id": "bounceInWords",
       "name": "Bounce In Words",
+      "category": "Animate In",
       "description": "Words scale up from nothing with an overshoot, one after another.",
       "animators": [
         {
@@ -71,15 +75,13 @@
     {
       "id": "trackingIn",
       "name": "Tracking In",
+      "category": "Animate In",
       "description": "Widely spaced text tightens up while fading in.",
       "animators": [
         {
           "name": "Tracking In",
           "properties": { "tracking": 0, "opacity": 100 },
-          "keys": {
-            "tracking": [[0, 400], [1.6, 0]],
-            "opacity": [[0, 0], [0.8, 100]]
-          },
+          "keys": { "tracking": [[0, 40], [1.6, 0]], "opacity": [[0, 0], [0.8, 100]] },
           "ease": true,
           "selectors": []
         }
@@ -88,6 +90,7 @@
     {
       "id": "scramble",
       "name": "Scramble",
+      "category": "Animate In",
       "description": "Letters cycle through random characters before settling, left to right.",
       "animators": [
         {
@@ -110,6 +113,7 @@
     {
       "id": "blurIn",
       "name": "Blur In",
+      "category": "Animate In",
       "description": "Characters come into focus and fade in, left to right.",
       "animators": [
         {
@@ -129,6 +133,7 @@
     {
       "id": "jitter",
       "name": "Jitter",
+      "category": "Loops",
       "description": "Characters wobble randomly in position and rotation, continuously.",
       "animators": [
         {
@@ -147,6 +152,7 @@
     {
       "id": "dropInLines",
       "name": "Drop In Lines",
+      "category": "Animate In",
       "description": "Lines drop from above with a slight rotation, one after another.",
       "animators": [
         {
@@ -159,6 +165,713 @@
               "keys": { "offset": [[0, -100], [1.4, 100]] },
               "ease": true
             }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fadeInWords",
+      "name": "Fade In Words",
+      "category": "Animate In",
+      "description": "Words fade in one after another.",
+      "animators": [
+        {
+          "name": "Fade In Words",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1, "advanced/basedOn": 2 },
+              "keys": { "offset": [[0.0, -100], [1.5, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "riseUpLines",
+      "name": "Rise Up Lines",
+      "category": "Animate In",
+      "description": "Lines rise into place and fade in, one after another.",
+      "animators": [
+        {
+          "name": "Rise Up",
+          "properties": { "position": [0, 60, 0], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1, "advanced/basedOn": 3, "advanced/easeHigh": 60 },
+              "keys": { "offset": [[0.0, -100], [1.6, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "popInCharacters",
+      "name": "Pop In Characters",
+      "category": "Animate In",
+      "description": "Characters pop up from nothing with a small overshoot, left to right.",
+      "animators": [
+        {
+          "name": "Pop Scale",
+          "properties": { "scale": [0, 0, 100], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1 },
+              "keys": { "offset": [[0.0, -100], [1.2, 100]] }
+            }
+          ]
+        },
+        {
+          "name": "Pop Overshoot",
+          "properties": { "scale": [125, 125, 100] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 3, "end": 25 },
+              "keys": { "offset": [[0.1, -25], [1.4, 100]] }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "spinInCharacters",
+      "name": "Spin In Characters",
+      "category": "Animate In",
+      "description": "Characters spin and grow into place, left to right.",
+      "animators": [
+        {
+          "name": "Spin In",
+          "properties": { "rotation": -180, "scale": [0, 0, 100], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1, "advanced/easeLow": 50 },
+              "keys": { "offset": [[0.0, -100], [1.6, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "randomFadeIn",
+      "name": "Random Fade In",
+      "category": "Animate In",
+      "description": "Characters fade in softly in a random order.",
+      "animators": [
+        {
+          "name": "Random Fade In",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true },
+              "keys": { "start": [[0, 0], [2, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "slideInFromRight",
+      "name": "Slide In from Right",
+      "category": "Animate In",
+      "description": "Characters slide in from the right and fade in, one after another.",
+      "animators": [
+        {
+          "name": "Slide In",
+          "properties": { "position": [220, 0, 0], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1, "advanced/easeHigh": 70 },
+              "keys": { "offset": [[0.0, -100], [1.4, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "zoomDownCharacters",
+      "name": "Zoom Down Characters",
+      "category": "Animate In",
+      "description": "Characters shrink from large and blurred into place, left to right.",
+      "animators": [
+        {
+          "name": "Zoom Down",
+          "properties": { "scale": [400, 400, 100], "blur": [20, 20], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1, "advanced/easeLow": 40 },
+              "keys": { "offset": [[0.0, -100], [1.5, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "flipUpCharacters",
+      "name": "Flip Up Characters",
+      "category": "Animate In",
+      "description": "Characters flip up into place around their baseline in 3D, left to right (turns on Per-character 3D).",
+      "perChar3d": true,
+      "animators": [
+        {
+          "name": "Flip Up",
+          "properties": { "rotationX": -90, "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1 },
+              "keys": { "offset": [[0.0, -100], [1.5, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "skewIn",
+      "name": "Skew In",
+      "category": "Animate In",
+      "description": "Characters slide in slanted and straighten up, left to right.",
+      "animators": [
+        {
+          "name": "Skew In",
+          "properties": { "skew": 45, "position": [90, 0, 0], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1 },
+              "keys": { "offset": [[0.0, -100], [1.3, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fallInCharacters",
+      "name": "Fall In Characters",
+      "category": "Animate In",
+      "description": "Characters fall from above and land with a small bounce, left to right.",
+      "animators": [
+        {
+          "name": "Fall",
+          "properties": { "position": [0, -200, 0], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 1, "advanced/easeHigh": 80 },
+              "keys": { "offset": [[0.0, -100], [1.2, 100]] }
+            }
+          ]
+        },
+        {
+          "name": "Landing Bounce",
+          "properties": { "position": [0, 14, 0] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 3, "end": 20 },
+              "keys": { "offset": [[0.15, -20], [1.4, 100]] }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fadeOutCharacters",
+      "name": "Fade Out Characters",
+      "category": "Animate Out",
+      "description": "Characters fade out, left to right.",
+      "animators": [
+        {
+          "name": "Fade Out",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 2 },
+              "keys": { "offset": [[0.0, -100], [1.5, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "fallAwayCharacters",
+      "name": "Fall Away Characters",
+      "category": "Animate Out",
+      "description": "Characters drop, tilt and fade out, left to right.",
+      "animators": [
+        {
+          "name": "Fall Away",
+          "properties": { "position": [0, 120, 0], "rotation": 20, "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 2, "advanced/easeLow": 60 },
+              "keys": { "offset": [[0.0, -100], [1.5, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "backspace",
+      "name": "Backspace",
+      "category": "Animate Out",
+      "description": "Characters disappear one at a time from the end, as if deleted.",
+      "animators": [
+        {
+          "name": "Backspace",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/smoothness": 0 },
+              "keys": { "start": [[0, 100], [1.5, 0]] }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "blurOut",
+      "name": "Blur Out",
+      "category": "Animate Out",
+      "description": "Characters blur, grow and fade out, left to right.",
+      "animators": [
+        {
+          "name": "Blur Out",
+          "properties": { "blur": [40, 40], "opacity": 0, "scale": [140, 140, 100] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 2, "advanced/easeLow": 60 },
+              "keys": { "offset": [[0.0, -100], [1.4, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "trackingOut",
+      "name": "Tracking Out",
+      "category": "Animate Out",
+      "description": "The text spreads apart while fading out.",
+      "animators": [
+        {
+          "name": "Tracking Out",
+          "properties": { "tracking": 0, "opacity": 100 },
+          "keys": { "tracking": [[0, 0], [1.6, 40]], "opacity": [[0.8, 100], [1.6, 0]] },
+          "ease": true,
+          "selectors": []
+        }
+      ]
+    },
+    {
+      "id": "randomFadeOut",
+      "name": "Random Fade Out",
+      "category": "Animate Out",
+      "description": "Characters fade out softly in a random order.",
+      "animators": [
+        {
+          "name": "Random Fade Out",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "end": 0 },
+              "keys": { "end": [[0, 0], [2, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "shrinkOutWords",
+      "name": "Shrink Out Words",
+      "category": "Animate Out",
+      "description": "Words shrink to nothing, one after another.",
+      "animators": [
+        {
+          "name": "Shrink Out",
+          "properties": { "scale": [0, 0, 100], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 2, "advanced/basedOn": 2 },
+              "keys": { "offset": [[0.0, -100], [1.3, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "spinOutCharacters",
+      "name": "Spin Out Characters",
+      "category": "Animate Out",
+      "description": "Characters spin and shrink away, left to right.",
+      "animators": [
+        {
+          "name": "Spin Out",
+          "properties": { "rotation": 180, "scale": [0, 0, 100], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 2, "advanced/easeHigh": 50 },
+              "keys": { "offset": [[0.0, -100], [1.6, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dropOutLines",
+      "name": "Drop Out Lines",
+      "category": "Animate Out",
+      "description": "Lines drop away with a slight rotation, one after another.",
+      "animators": [
+        {
+          "name": "Drop Out",
+          "properties": { "position": [0, 140, 0], "rotation": 8, "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 2, "advanced/basedOn": 3, "advanced/easeLow": 80 },
+              "keys": { "offset": [[0.0, -100], [1.4, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "slideOutToLeft",
+      "name": "Slide Out to Left",
+      "category": "Animate Out",
+      "description": "Characters slide off to the left and fade out, one after another.",
+      "animators": [
+        {
+          "name": "Slide Out",
+          "properties": { "position": [-220, 0, 0], "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 2, "advanced/easeLow": 70 },
+              "keys": { "offset": [[0.0, -100], [1.4, 100]] },
+              "ease": true
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "wave",
+      "name": "Wave",
+      "category": "Loops",
+      "description": "Characters bob up and down in a travelling wave, continuously.",
+      "animators": [
+        {
+          "name": "Wave",
+          "properties": { "position": [0, -24, 0] },
+          "selectors": [
+            { "kind": "range" },
+            {
+              "kind": "expression",
+              "expr": { "amount": "var a = Math.sin(time * 4 - textIndex * 0.6) * 100; [a, a, a]" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "swing",
+      "name": "Swing",
+      "category": "Loops",
+      "description": "Characters rock back and forth one after another, continuously.",
+      "animators": [
+        {
+          "name": "Swing",
+          "properties": { "rotation": 18 },
+          "selectors": [
+            { "kind": "range" },
+            {
+              "kind": "expression",
+              "expr": { "amount": "var a = Math.sin(time * 3 - textIndex * 0.5) * 100; [a, a, a]" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "colorWave",
+      "name": "Color Wave",
+      "category": "Loops",
+      "description": "A wave of colour runs through the characters, continuously.",
+      "animators": [
+        {
+          "name": "Color Wave",
+          "properties": { "fillColor": [0.2, 0.75, 1.0, 1.0] },
+          "selectors": [
+            { "kind": "range" },
+            {
+              "kind": "expression",
+              "expr": { "amount": "var a = (Math.sin(time * 3 - textIndex * 0.4) * 0.5 + 0.5) * 100; [a, a, a]" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "pulseWords",
+      "name": "Pulse Words",
+      "category": "Loops",
+      "description": "Words swell one after another, continuously.",
+      "animators": [
+        {
+          "name": "Pulse Words",
+          "properties": { "scale": [118, 118, 100] },
+          "selectors": [
+            { "kind": "range" },
+            {
+              "kind": "expression",
+              "set": { "basedOn": 2 },
+              "expr": { "amount": "var a = Math.max(0, Math.sin(time * 3 - textIndex * 1.2)) * 100; [a, a, a]" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "highlightSweep",
+      "name": "Highlight Sweep",
+      "category": "Loops",
+      "description": "A highlight sweeps across the text every 2.5 seconds, lifting and colouring the characters it passes.",
+      "animators": [
+        {
+          "name": "Highlight Sweep",
+          "properties": { "scale": [120, 120, 100], "position": [0, -8, 0], "fillColor": [1.0, 0.85, 0.3, 1.0] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/shape": 3, "end": 30 },
+              "expr": { "offset": "-30 + (time % 2.5) / 2.5 * 135" }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "neonFlicker",
+      "name": "Neon Flicker",
+      "category": "Loops",
+      "description": "Characters flicker on their own like a failing neon sign, continuously.",
+      "animators": [
+        {
+          "name": "Neon Flicker",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            { "kind": "range" },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 9, "correlation": 0, "minAmount": 0, "maxAmount": 100 }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "breathingText",
+      "name": "Breathing Text",
+      "category": "Loops",
+      "description": "The text slowly opens up and closes its spacing, continuously.",
+      "animators": [
+        {
+          "name": "Breathing Text",
+          "properties": { "tracking": 0 },
+          "expr": { "tracking": "(Math.sin(time * 1.6) * 0.5 + 0.5) * 14" },
+          "selectors": []
+        }
+      ]
+    },
+    {
+      "id": "dataDamageOn",
+      "name": "Data Damage On",
+      "category": "Animate In",
+      "description": "Characters flicker into view in a random order as scrambled, jumping glyphs that settle into the text (about 30 frames).",
+      "animators": [
+        {
+          "name": "Glitch Reveal",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0, 0], [0.7, 100]] }
+            }
+          ]
+        },
+        {
+          "name": "Data Scramble",
+          "properties": { "characterOffset": 24, "position": [16, 0, 0] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0.3, 0], [1, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 14, "correlation": 0, "minAmount": -100, "maxAmount": 100 }
+            }
+          ]
+        },
+        {
+          "name": "Signal Flicker",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0.3, 0], [1, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 11, "correlation": 0, "minAmount": 0, "maxAmount": 100 }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dataDamageOnShort",
+      "name": "Data Damage On (Short)",
+      "category": "Animate In",
+      "description": "The short version of Data Damage On (about 18 frames).",
+      "animators": [
+        {
+          "name": "Glitch Reveal",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0, 0], [0.42, 100]] }
+            }
+          ]
+        },
+        {
+          "name": "Data Scramble",
+          "properties": { "characterOffset": 24, "position": [16, 0, 0] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0.18, 0], [0.6, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 14, "correlation": 0, "minAmount": -100, "maxAmount": 100 }
+            }
+          ]
+        },
+        {
+          "name": "Signal Flicker",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0.18, 0], [0.6, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 11, "correlation": 0, "minAmount": 0, "maxAmount": 100 }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dataDamageOff",
+      "name": "Data Damage Off",
+      "category": "Animate Out",
+      "description": "Characters break up into scrambled, flickering glyphs and drop out in a random order.",
+      "animators": [
+        {
+          "name": "Data Scramble",
+          "properties": { "characterOffset": 24, "position": [16, 0, 0] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "end": [[0, 0], [0.7, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 14, "correlation": 0, "minAmount": -100, "maxAmount": 100 }
+            }
+          ]
+        },
+        {
+          "name": "Signal Flicker",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "end": [[0, 0], [0.7, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 11, "correlation": 0, "minAmount": 0, "maxAmount": 100 }
+            }
+          ]
+        },
+        {
+          "name": "Glitch Erase",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "end": [[0.3, 0], [1, 100]] }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dataGlitch",
+      "name": "Data Glitch",
+      "category": "Loops",
+      "description": "Now and then a few characters break up into random glyphs and jump sideways, continuously.",
+      "animators": [
+        {
+          "name": "Data Glitch",
+          "properties": { "characterOffset": 18, "position": [22, 0, 0], "opacity": 40 },
+          "selectors": [
+            { "kind": "range" },
+            { "kind": "expression", "expr": { "amount": "var k = Math.floor(time * 12); var h = Math.sin(k * 12.9898 + textIndex * 78.233) * 43758.5453; h = h - Math.floor(h); var a = h > 0.9 ? 100 : 0; [a, a, a]" } }
           ]
         }
       ]

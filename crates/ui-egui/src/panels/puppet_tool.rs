@@ -12,7 +12,7 @@ use effectcraft_engine::render::EvalCtx;
 use effectcraft_engine::time::Tick;
 use egui::{Color32, Pos2, Stroke};
 
-use super::viewer::{ViewerMap, l2c};
+use super::viewer::{ViewerMap, fx2c};
 use crate::EffectcraftApp;
 
 /// Deformed meshes of a layer's Puppet effect: (mesh uid, mesh, deformed vertices, pins).
@@ -70,7 +70,7 @@ struct Cached {
 pub fn overlay(app: &EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer: &Layer, t: Tick) -> Option<Overlay> {
     let fx = layer.effects()?.groups().find(|g| puppet::is_puppet(g))?;
     let key = (app.session.revision, cid.0, layer.id.0, t.0);
-    let id = egui::Id::new(("puppet-overlay", layer.id.0));
+    let id = egui::Id::unique(("puppet-overlay", layer.id.0));
     if let Some(c) = ctx.data(|d| d.get_temp::<Cached>(id))
         && c.key == key
     {
@@ -89,7 +89,7 @@ pub fn overlay(app: &EffectcraftApp, ctx: &egui::Context, cid: ItemId, layer: &L
 /// rigged, as in After Effects (#284).
 pub fn target(ectx: &EvalCtx, layers: &[(&Layer, Overlay)], cpt: [f64; 2], on_art: impl Fn(&Layer) -> bool) -> Option<LayerId> {
     let on_mesh = |l: &Layer, ov: &Overlay| {
-        let Some(inv) = l2c(ectx, l).0.inverse() else { return false };
+        let Some(inv) = fx2c(ectx, l).inverse() else { return false };
         let p = inv.apply(gv2(cpt[0], cpt[1]));
         ov.iter().any(|(_, mesh, def, _)| puppet::contains(mesh, def, [p.x, p.y]))
     };
@@ -106,7 +106,7 @@ pub fn reveal_pin(app: &mut EffectcraftApp, layer: LayerId, pin: u64) {
     }
 }
 
-/// Where a pin sits now (layer space): its Position, or (Bend / Starch / Overlap pins) its rest
+/// Where a pin sits now (effect space): its Position, or (Bend / Starch / Overlap pins) its rest
 /// point carried along by the deformation.
 pub fn pin_position(mesh: &Mesh, def: &[[f64; 2]], p: &Pin) -> [f64; 2] {
     if p.kind.moves() {
@@ -148,7 +148,7 @@ pub fn draw(
     selected: &[u64],
     hover: Option<Pos2>,
 ) -> Vec<PinHit> {
-    let (m, _) = l2c(ectx, layer);
+    let m = fx2c(ectx, layer);
     let scr = |q: [f64; 2]| {
         let c = m.apply(gv2(q[0], q[1]));
         map.to_screen([c.x, c.y])

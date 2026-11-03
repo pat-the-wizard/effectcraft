@@ -4,15 +4,17 @@
 //! |---|---|---|---|---|
 //! | H.264 | MP4 | FilmCraft H.264 High, 8-bit 4:2:0 BT.709 limited, VBR | no | AAC-LC (FilmCraft), mono/stereo |
 //! | ProRes | QuickTime MOV | FilmCraft ProRes 422 Proxy/LT/422/HQ, 10-bit; 4444/4444 XQ 4:4:4 | 4444 (16-bit alpha coding) | PCM 16/24-bit or 32-bit float, mono/stereo |
+//! | Uncompressed | QuickTime MOV (`raw `) | 8-bit RGB (depth 24, rows padded to even bytes) or ARGB (depth 32) | RGB + Alpha (straight or premultiplied) | PCM 16/24-bit or 32-bit float, mono/stereo |
 //! | PNG / JPEG / TIFF sequence | one file per frame | 8-bit | PNG, TIFF | — |
 //! | OpenEXR sequence | one file per frame | 32-bit float, linear light, premultiplied | yes | — |
+//! | Targa sequence | one file per frame | uncompressed 8-bit: 24-bit RGB, 32-bit RGB + Alpha (8 alpha bits), 8-bit grey for Alpha; top-left origin | yes (straight or premultiplied) | — |
 //! | Animated GIF | GIF89a | 256-colour palette per frame (NeuQuant) | 1-bit | — |
 //! | WebM | WebM (Matroska) | VP9 profile 0 (`effectcraft-vp9enc`: key + inter frames, a key frame every 2 s, loop filter), 8-bit 4:2:0; or AV1 (`effectcraft-av1enc`) | VP9 alpha (BlockAdditional) | Opus (`effectcraft-opusenc`: SILK / hybrid / CELT by bitrate and application), 48 kHz |
 //! | HEVC | MP4 (`hvc1`) | `effectcraft-hevcenc` Main / Main 10 4:2:0, I + P slices, bitrate or constant quality, level, key-frame interval | no | AAC-LC (FilmCraft) |
 //! | AV1 | MP4 (`av01`) | `effectcraft-av1enc` Main 8/10-bit 4:2:0, key + inter frames | no | AAC-LC (FilmCraft) |
-//! | WAV / AIFF | RIFF WAVE / AIFF | — | — | PCM 16/24-bit (WAV also 32-bit float), mono/stereo (audio only) |
+//! | WAV / AIFF | RIFF WAVE / AIFF (AIFF-C for float) | — | — | PCM 16/24-bit or 32-bit float, mono/stereo (audio only) |
 //!
-//! Every frame goes through [`pipeline`]: the Render Settings overrides (Effects, Solo Switches,
+//! Every frame goes through the internal `pipeline` module: the Render Settings overrides (Effects, Solo Switches,
 //! Guide Layers, Frame Blending, Motion Blur, Color Depth), field rendering (two fields half a
 //! frame apart woven line by line, with optional 3:2 pulldown from film frames at 4/5 of the
 //! rate), then the Output Module's Crop (edges or the region of interest) and Resize. Channels
@@ -21,7 +23,8 @@
 //! render log (Errors Only / Plus Settings / Plus Per Frame Info) is written next to the output.
 //!
 //! Frames are rendered in parallel batches (rayon; one batch ≈ one frame per core) and handed to
-//! the encoder in order. Progress is reported after each batch through a callback that can cancel
+//! the encoder in order. They share the job's layer cache, as viewer frames share the viewer's:
+//! static and transform-only layers render once per job. Progress is reported after each batch through a callback that can cancel
 //! the job by returning `false`. Codecs and the MP4/MOV muxer are FilmCraft's pure-Rust crates
 //! (plan ADR 0001); nothing outside this crate touches them.
 //!
@@ -34,6 +37,7 @@ mod encode;
 mod hevc_av1;
 mod out;
 mod pipeline;
+mod uncompressed;
 mod webm;
 mod webm_av1;
 
@@ -74,7 +78,8 @@ pub struct Job<'a> {
     pub project: &'a Project,
     pub footage: &'a dyn FootageSource,
     pub expr: Option<&'a dyn ExprHost>,
-    /// GPU compositor: used when the project's renderer is Mercury GPU Acceleration.
+    /// GPU compositor: used for every frame of the job when the project's renderer is Mercury
+    /// GPU Acceleration (frames it declines render on the CPU).
     pub accel: Option<&'a dyn effectcraft_render::Accelerator>,
     pub comp: ItemId,
     pub settings: &'a RenderSettings,
@@ -171,6 +176,10 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
     let t0 = Instant::now();
     let cx = Cx::new(job);
     let mut r = export_with(&cx, progress, t0).await;
+    if matches!(r, Err(ExportError::Cancelled)) {
+        cx.remove_cancelled_outputs()?;
+        return r;
+    }
     let log = cx.write_log(&r, t0.elapsed().as_secs_f64());
     if let Ok(rep) = &mut r {
         rep.log = log;
@@ -186,7 +195,9 @@ async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t
     st.advance(0)?;
     let (w, h) = output_size(comp, cx.settings, cx.output);
     let mut report = match cx.output.format {
-        OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes => encode::movie(cx, comp, w, h, &mut st).await?,
+        OutputFormat::H264 | OutputFormat::Hevc | OutputFormat::Av1 | OutputFormat::ProRes | OutputFormat::Uncompressed => {
+            encode::movie(cx, comp, w, h, &mut st).await?
+        }
         OutputFormat::Gif => gif_export(cx, comp, w, h, &mut st).await?,
         OutputFormat::WebM => webm::webm(cx, comp, w, h, &mut st).await?,
         OutputFormat::Wav => webm::audio_file(cx, comp, false, &mut st)?,
@@ -260,10 +271,10 @@ async fn sequence(cx: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) 
                 let path = sequence_path(cx.path, f0 + k as i64);
                 // Encode in memory first: the storage hook decides where it fits.
                 let mut buf = std::io::Cursor::new(Vec::new());
-                write_still(cx, &mut buf, fmt, &img, comp, channels, w, h, cx.output.quality)?;
+                write_still(cx, &mut buf, &img, comp, StillOutput { format: fmt, channels, size: (w, h), quality: cx.output.quality })?;
                 let data = buf.into_inner();
                 let path = cx.place(&path, data.len() as u64);
-                let mut f = out::create(cx.sink, &path)?;
+                let mut f = cx.create(&path)?;
                 std::io::Write::write_all(&mut f, &data).map_err(io)?;
                 f.finish()
             })
@@ -277,22 +288,20 @@ async fn sequence(cx: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_>) 
     Ok(Report { path: sequence_path(cx.path, f0), frames: 0, width: w, height: h, seconds: 0.0, bytes, audio: false, log: None, overflow: vec![] })
 }
 
-#[allow(clippy::too_many_arguments)]
-fn write_still<W: std::io::Write + std::io::Seek>(
-    cx: &Cx,
-    file: &mut W,
-    fmt: OutputFormat,
-    img: &Image,
-    comp: &Comp,
+struct StillOutput {
+    format: OutputFormat,
     channels: Channels,
-    w: u32,
-    h: u32,
+    size: (u32, u32),
     quality: u8,
-) -> Result<()> {
+}
+
+fn write_still<W: std::io::Write + std::io::Seek>(cx: &Cx, file: &mut W, img: &Image, comp: &Comp, output: StillOutput) -> Result<()> {
+    let StillOutput { format: fmt, channels, size: (w, h), quality } = output;
     use image::{ExtendedColorType, ImageEncoder, ImageFormat};
     match fmt {
         OutputFormat::ExrSequence => {
             // Linear light, premultiplied (the EXR convention); RGB keeps alpha = 1 over the background.
+            // Colour is floored at 0 but not capped at 1: a 32 bpc frame's over-range values survive (#339).
             let lin = |v: f32| if v <= 0.04045 { v / 12.92 } else { ((v + 0.055) / 1.055).powf(2.4) };
             let mut data = Vec::with_capacity((w * h * 4) as usize);
             for y in 0..h {
@@ -305,12 +314,12 @@ fn write_still<W: std::io::Write + std::io::Seek>(
                         }
                         Channels::Rgba => {
                             let a = p[3].clamp(0.0, 1.0);
-                            let s = |c: f32| if a > 0.0 { lin((c / a).clamp(0.0, 1.0)) * a } else { 0.0 };
+                            let s = |c: f32| if a > 0.0 { lin((c / a).max(0.0)) * a } else { 0.0 };
                             ([s(p[0]), s(p[1]), s(p[2])], a)
                         }
                         Channels::Rgb => {
                             let k = 1.0 - p[3].clamp(0.0, 1.0);
-                            let c = |i: usize| lin((p[i] + comp.background[i] * k).clamp(0.0, 1.0));
+                            let c = |i: usize| lin((p[i] + comp.background[i] * k).max(0.0));
                             ([c(0), c(1), c(2)], 1.0)
                         }
                     };
@@ -327,19 +336,22 @@ fn write_still<W: std::io::Write + std::io::Seek>(
                 .write_image(&rgb, w, h, ExtendedColorType::Rgb8)
                 .map_err(|e| ExportError::Encode(e.to_string()))
         }
-        OutputFormat::PngSequence | OutputFormat::TiffSequence => {
+        OutputFormat::PngSequence | OutputFormat::TiffSequence | OutputFormat::TargaSequence => {
             let px = cx.pixels(img, comp, channels, w, h);
             let (data, ct) = match channels {
                 Channels::Rgba => (px, ExtendedColorType::Rgba8),
                 Channels::Alpha => (px.as_chunks::<4>().0.iter().map(|p| p[0]).collect(), ExtendedColorType::L8),
                 Channels::Rgb => (px.as_chunks::<4>().0.iter().flat_map(|p| [p[0], p[1], p[2]]).collect(), ExtendedColorType::Rgb8),
             };
-            if fmt == OutputFormat::PngSequence {
-                image::codecs::png::PngEncoder::new(file).write_image(&data, w, h, ct).map_err(|e| ExportError::Encode(e.to_string()))
-            } else {
+            match fmt {
+                OutputFormat::PngSequence => image::codecs::png::PngEncoder::new(file).write_image(&data, w, h, ct),
+                // Uncompressed (the encoder's run-length compression is off), top-left origin, the
+                // alpha bits in the image descriptor: 8 for RGB + Alpha, 0 otherwise.
+                OutputFormat::TargaSequence => image::codecs::tga::TgaEncoder::new(file).disable_rle().write_image(&data, w, h, ct),
                 // (the TIFF encoder needs Seek)
-                image::codecs::tiff::TiffEncoder::new(file).write_image(&data, w, h, ct).map_err(|e| ExportError::Encode(e.to_string()))
+                _ => image::codecs::tiff::TiffEncoder::new(file).write_image(&data, w, h, ct),
             }
+            .map_err(|e| ExportError::Encode(e.to_string()))
         }
         f => Err(ExportError::Unsupported(format!("{} is not a still format", f.label()))),
     }
@@ -350,7 +362,7 @@ async fn gif_export(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_
         return Err(ExportError::Unsupported("GIF frames are limited to 65535 px".into()));
     }
     let path = job.place(job.path, 1);
-    let mut file = out::create(job.sink, &path)?;
+    let mut file = job.create(&path)?;
     let mut enc = gif::Encoder::new(&mut file, w as u16, h as u16, &[]).map_err(|e| ExportError::Encode(e.to_string()))?;
     enc.set_repeat(if job.output.gif_loop { gif::Repeat::Infinite } else { gif::Repeat::Finite(0) }).map_err(|e| ExportError::Encode(e.to_string()))?;
     let rate = job.settings.rate(comp);
@@ -364,7 +376,7 @@ async fn gif_export(job: &Cx<'_>, comp: &Comp, w: u32, h: u32, st: &mut State<'_
         let end = (i + batch).min(st.total);
         let frames: Vec<gif::Frame<'static>> = job
             .frames(comp, (i..end).collect(), |_, img| {
-                let mut px = job.pixels(&img, comp, job.output.channels, w, h);
+                let mut px = job.pixels_with(&img, comp, job.output.channels, w, h, false);
                 gif::Frame::from_rgba_speed(w as u16, h as u16, &mut px, 10)
             })
             .await;

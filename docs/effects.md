@@ -3,11 +3,11 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 306 effects with 3009 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
+EffectCraft ships 312 effects with 3148 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
 - **GPU**: 280 effects also run on the GPU compositor with identical results.
-- **32**: 306 effects process 32-bit float (HDR, overbright) pixels without clamping.
-- **Status**: 306 implemented in full, 0 partial (what is missing is listed).
+- **32**: 312 effects process 32-bit float (HDR, overbright) pixels without clamping.
+- **Status**: 312 implemented in full, 0 partial (what is missing is listed).
 
 Effects are addressed by id (`ec.<category>.<name>`) or display name in commands, scripts and the control channel, and every parameter by its id (`effects/#1/blurriness`).
 
@@ -16,6 +16,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Effect | Id | Params | GPU | 32 | Status |
 |---|---|---:|:-:|:-:|---|
 | 3D Channel Extract | `ec.3d.channelextract` | 6 | GPU | 32 | Implemented |
+| 3D Layer Instance | `ec.3d.instance3d` | 1 |  | 32 | Implemented |
 | Cryptomatte | `ec.3d.cryptomatte` | 4 | GPU | 32 | Implemented |
 | Depth Matte | `ec.3d.depthmatte` | 3 | GPU | 32 | Implemented |
 | Depth of Field | `ec.3d.depthoffield` | 4 | GPU | 32 | Implemented |
@@ -149,7 +150,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Corner Pin | `ec.distort.cornerpin` | 4 | GPU | 32 | Implemented |
 | Detail-preserving Upscale | `ec.distort.upscale` | 4 |  | 32 | Implemented |
 | Displacement Map | `ec.distort.displacementmap` | 8 | GPU | 32 | Implemented |
-| Liquify | `ec.distort.liquify` | 12 | GPU | 32 | Implemented |
+| Liquify | `ec.distort.liquify` | 13 | GPU | 32 | Implemented |
 | Magnify | `ec.distort.magnify` | 10 | GPU | 32 | Implemented |
 | Mesh Warp | `ec.distort.meshwarp` | 3 | GPU | 32 | Implemented |
 | Mirror | `ec.distort.mirror` | 2 | GPU | 32 | Implemented |
@@ -209,6 +210,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Grid | `ec.generate.grid` | 12 | GPU | 32 | Implemented |
 | Lens Flare | `ec.generate.lensflare` | 4 | GPU | 32 | Implemented |
 | Paint Bucket | `ec.generate.paintbucket` | 11 | GPU | 32 | Implemented |
+| Plexus | `ec.generate.plexus` | 94 |  | 32 | Implemented |
 | Radio Waves | `ec.generate.radiowaves` | 31 | GPU | 32 | Implemented |
 | Scribble | `ec.generate.scribble` | 25 | GPU | 32 | Implemented |
 | Stroke | `ec.generate.stroke` | 11 | GPU | 32 | Implemented |
@@ -255,9 +257,10 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 |---|---|---:|:-:|:-:|---|
 | Matte Choker | `ec.matte.mattechoker` | 7 | GPU | 32 | Implemented |
 | Mocha shape | `ec.obsolete.mochashape` | 6 |  | 32 | Implemented |
+| Object Matte | `ec.matte.objectmatte` | 13 |  | 32 | Implemented |
 | Refine Hard Matte | `ec.matte.refinehard` | 16 | GPU | 32 | Implemented |
 | Refine Soft Matte | `ec.matte.refinesoft` | 18 | GPU | 32 | Implemented |
-| Roto Brush & Refine Edge | `ec.matte.rotobrush` | 24 |  | 32 | Implemented |
+| Roto Brush & Refine Edge | `ec.matte.rotobrush` | 25 |  | 32 | Implemented |
 | Simple Choker | `ec.matte.simplechoker` | 2 | GPU | 32 | Implemented |
 
 ## Noise & Grain
@@ -306,7 +309,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | 3D Glasses | `ec.perspective.3dglasses` | 8 | GPU | 32 | Implemented |
 | Bevel Alpha | `ec.perspective.bevelalpha` | 4 | GPU | 32 | Implemented |
 | Bevel Edges | `ec.perspective.beveledges` | 4 | GPU | 32 | Implemented |
-| CC Cylinder | `ec.perspective.cccylinder` | 12 | GPU | 32 | Implemented |
+| CC Cylinder | `ec.perspective.cccylinder` | 15 | GPU | 32 | Implemented |
 | CC Environment | `ec.perspective.ccenvironment` | 4 | GPU | 32 | Implemented |
 | CC Sphere | `ec.perspective.ccsphere` | 14 | GPU | 32 | Implemented |
 | CC Spotlight | `ec.perspective.ccspotlight` | 8 | GPU | 32 | Implemented |
@@ -323,7 +326,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Hair | `ec.sim.cchair` | 20 | GPU | 32 | Implemented |
 | CC Mr. Mercury | `ec.sim.ccmrmercury` | 23 | GPU | 32 | Implemented |
 | CC Particle Systems II | `ec.sim.ccparticlesystems2` | 21 | GPU | 32 | Implemented |
-| CC Particle World | `ec.sim.ccparticleworld` | 30 | GPU | 32 | Implemented |
+| CC Particle World | `ec.sim.ccparticleworld` | 36 | GPU | 32 | Implemented |
 | CC Pixel Polly | `ec.sim.ccpixelpolly` | 10 | GPU | 32 | Implemented |
 | CC Rainfall | `ec.sim.ccrainfall` | 14 | GPU | 32 | Implemented |
 | CC Scatterize | `ec.sim.ccscatterize` | 4 | GPU | 32 | Implemented |
@@ -354,12 +357,15 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Vignette | `ec.stylize.ccvignette` | 4 | GPU | 32 | Implemented |
 | Cartoon | `ec.stylize.cartoon` | 12 | GPU | 32 | Implemented |
 | Color Emboss | `ec.stylize.coloremboss` | 4 | GPU | 32 | Implemented |
+| Data Damage | `ec.stylize.datadamage` | 15 |  | 32 | Implemented |
 | Emboss | `ec.stylize.emboss` | 4 | GPU | 32 | Implemented |
 | Find Edges | `ec.stylize.findedges` | 2 | GPU | 32 | Implemented |
 | Glow | `ec.stylize.glow` | 14 | GPU | 32 | Implemented |
 | Mosaic | `ec.stylize.mosaic` | 3 | GPU | 32 | Implemented |
 | Motion Tile | `ec.stylize.motiontile` | 8 | GPU | 32 | Implemented |
+| Pixel Sort | `ec.stylize.pixelsort` | 30 |  | 32 | Implemented |
 | Posterize | `ec.stylize.posterize` | 1 | GPU | 32 | Implemented |
+| Retro Dither | `ec.stylize.retrodither` | 22 |  | 32 | Implemented |
 | Roughen Edges | `ec.stylize.roughenedges` | 13 | GPU | 32 | Implemented |
 | Scatter | `ec.stylize.scatter` | 3 | GPU | 32 | Implemented |
 | Strobe Light | `ec.stylize.strobe` | 7 | GPU | 32 | Implemented |
@@ -412,7 +418,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 
 | Effect | Id | Params | GPU | 32 | Status |
 |---|---|---:|:-:|:-:|---|
-| Apply Color LUT | `ec.utility.applylut` | 0 | GPU | 32 | Implemented |
+| Apply Color LUT | `ec.utility.applylut` | 1 | GPU | 32 | Implemented |
 | CC Overbrights | `ec.utility.ccoverbrights` | 2 | GPU | 32 | Implemented |
 | Cineon Converter | `ec.utility.cineon` | 7 | GPU | 32 | Implemented |
 | Color Profile Converter | `ec.utility.colorprofileconverter` | 7 | GPU | 32 | Implemented |

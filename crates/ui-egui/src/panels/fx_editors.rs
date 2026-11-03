@@ -11,11 +11,14 @@
 //! - Reshape: correspondence point list buttons here, and on the Composition viewer the source
 //!   and destination mask outlines with draggable correspondence handles ([`reshape_overlay`]);
 //! - EXtractoR: a Layer popup of the footage's OpenEXR layers, and Red / Green / Blue / Alpha
-//!   popups of its channels ([`channel_popup`]).
+//!   popups of its channels ([`channel_popup`]);
+//! - Mesh Warp: on the Composition viewer, the distortion mesh's grid over the layer with a
+//!   draggable handle on every vertex ([`mesh_warp_overlay`], #303).
 //!
 //! Every edit is a `prop.set` engine command (undoable; one drag = one undo step) and every
 //! handle registers an automation id.
 
+use crate::i18n::{tr, tr_args};
 use effectcraft_engine::effects::{ColoramaPalette, OffsetCurve};
 use effectcraft_engine::geom::Mat3;
 use effectcraft_engine::keyframe::Value;
@@ -36,6 +39,7 @@ pub const COLORAMA: &str = "ec.color.colorama";
 pub const GLOW: &str = "ec.stylize.glow";
 pub const RESHAPE: &str = "ec.distort.reshape";
 pub const EXTRACTOR: &str = "ec.3d.extractor";
+pub const MESH_WARP: &str = "ec.distort.meshwarp";
 
 fn str_value(layer: &Layer, ectx: &EvalCtx, g: &PropGroup, id: &str) -> String {
     match g.get(id).map(|p| ectx.value(layer, p)) {
@@ -62,24 +66,14 @@ fn register_points(app: &mut EffectcraftApp, prefix: &str, gr: Rect, pts: &[[f32
 }
 
 /// Small coloured tabs (`names[i]`, swatch `cols[i]`); returns the clicked one.
-fn tabs(
-    app: &mut EffectcraftApp,
-    ui: &mut egui::Ui,
-    p: &egui::Painter,
-    x0: f32,
-    cy: f32,
-    cur: usize,
-    names: &[&str],
-    cols: &[Color32],
-    id: &str,
-) -> Option<usize> {
+fn tabs(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, at: Pos2, cur: usize, (names, cols): (&[&str], &[Color32]), id: &str) -> Option<usize> {
     let t = app.tokens;
-    let mut x = x0;
+    let (mut x, cy) = (at.x, at.y);
     let mut out = None;
     for (i, name) in names.iter().enumerate() {
         let w = if cols.is_empty() { 16.0 + name.chars().count() as f32 * 6.2 } else { 20.0 };
         let r = Rect::from_min_size(pos2(x, cy - 9.0), vec2(w, 18.0));
-        let resp = ui.interact(r, egui::Id::new((id, i)), Sense::click());
+        let resp = ui.interact(r, egui::Id::unique((id, i)), Sense::click());
         let sel = i == cur;
         if sel {
             p.rect_filled(r, 3.0, t.row_selected);
@@ -107,10 +101,12 @@ fn tabs(
     out
 }
 
+/// A small "Reset" link centred in `r`, registered under the automation id `id`; returns whether
+/// it was clicked.
 fn reset_link(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, r: Rect, id: &str) -> bool {
     let t = app.tokens;
-    let resp = ui.interact(r, egui::Id::new(id), Sense::click());
-    p.text(r.center(), Align2::CENTER_CENTER, "Reset", Tokens::ui(11.5), if resp.hovered() { t.hot_text } else { t.text_dim });
+    let resp = ui.interact(r, egui::Id::unique(id), Sense::click());
+    p.text(r.center(), Align2::CENTER_CENTER, tr("Reset"), Tokens::ui(11.5), if resp.hovered() { t.hot_text } else { t.text_dim });
     app.auto.add(id, r, "Reset");
     resp.clicked()
 }
@@ -158,6 +154,10 @@ pub fn inline_editor(
 
 const RGB_CURVES: [(&str, &str); 4] = [("master", "Master"), ("red", "Red"), ("green", "Green"), ("blue", "Blue")];
 
+/// The Lumetri RGB Curves editor for effect group `g`: channel tabs (Master, Red, Green, Blue),
+/// the selected channel's curve graph with its Reset, and the point positions registered for
+/// automation. A curve edit or Reset is queued on `actions` as a `prop.set` of that channel's
+/// curve string; the visible channel is remembered in `app.ui.fx_curve_channel` per group.
 #[allow(clippy::too_many_arguments)]
 fn rgb_curves(
     app: &mut EffectcraftApp,
@@ -178,7 +178,7 @@ fn rgb_curves(
     let cy = r.min.y + 15.0;
     let cols = [Color32::from_gray(0xe8), Color32::from_rgb(0xf0, 0x50, 0x50), Color32::from_rgb(0x50, 0xd0, 0x60), Color32::from_rgb(0x50, 0x80, 0xff)];
     let names: Vec<&str> = RGB_CURVES.iter().map(|c| c.1).collect();
-    if let Some(n) = tabs(app, ui, p, x0, cy, ch, &names, &cols, &format!("{prefix}.channel")) {
+    if let Some(n) = tabs(app, ui, p, pos2(x0, cy), ch, (&names, &cols), &format!("{prefix}.channel")) {
         app.ui.fx_curve_channel.insert(g.uid, n);
     }
     let id = RGB_CURVES[ch].0;
@@ -188,15 +188,15 @@ fn rgb_curves(
         set_str(actions, layer, g, id, fw::CurvePoints::identity().format(), None);
     }
     let gr = Rect::from_min_size(pos2(x0, r.min.y + 30.0), vec2(size, size));
-    let gid = egui::Id::new(("lumetri-rgb", euid, ch));
-    let (resp, edit) = fw::curves_graph(ui, gr, &cur, ch, false, gid, &t);
+    let gid = egui::Id::unique(("lumetri-rgb", euid, ch));
+    let (resp, edit) = fw::curves_graph(ui, gr, &cur, ch, fw::CurveMode { pencil: false, natural: false }, gid, &t);
     app.auto.add(&format!("{prefix}.graph"), gr, "RGB Curves");
     register_points(app, &prefix, gr, &cur.0);
     let key = gesture_key(ui, gid, resp.drag_started() || resp.clicked());
     if let Some(np) = edit.changed {
         set_str(actions, layer, g, id, np.format(), Some(key));
     }
-    p.text(pos2(gr.min.x, gr.max.y + 11.0), Align2::LEFT_CENTER, "Click adds a point; drag one off to remove", Tokens::ui(10.5), t.text_faint);
+    p.text(pos2(gr.min.x, gr.max.y + 11.0), Align2::LEFT_CENTER, tr("Click adds a point; drag one off to remove"), Tokens::ui(10.5), t.text_faint);
 }
 
 /// A hue / saturation curve's points (`x,y` in 0..1, y = ½ neutral), any count (empty = flat).
@@ -265,6 +265,11 @@ fn hue_color(h: f32) -> Color32 {
     Color32::from(c)
 }
 
+/// The Lumetri Hue/Saturation Curves editor for effect group `g`: tabs for the Hue vs Sat,
+/// Hue vs Hue, Hue vs Luma, Luma vs Sat and Sat vs Sat curves, drawn as a neutral-relative offset
+/// curve over the axis' colour band, with point drag/add/remove gestures and a Reset. Changes are
+/// queued on `actions` as a `prop.set` of the selected curve's point list; the visible tab is kept
+/// in `app.ui.fx_curve_channel` per group.
 #[allow(clippy::too_many_arguments)]
 fn huesat_curves(
     app: &mut EffectcraftApp,
@@ -284,7 +289,7 @@ fn huesat_curves(
     let x0 = r.min.x + 38.0;
     let cy = r.min.y + 15.0;
     let names: Vec<&str> = HUESAT.iter().map(|c| c.1).collect();
-    if let Some(n) = tabs(app, ui, p, x0, cy, k, &names, &[], &format!("{prefix}.curve")) {
+    if let Some(n) = tabs(app, ui, p, pos2(x0, cy), k, (&names, &[]), &format!("{prefix}.curve")) {
         app.ui.fx_curve_channel.insert(g.uid, n);
     }
     let (id, name, axis, periodic) = HUESAT[k];
@@ -317,7 +322,7 @@ fn huesat_curves(
         })
         .collect();
     p.add(egui::Shape::line(line, Stroke::new(1.5, Color32::from_gray(0xe8))));
-    let gid = egui::Id::new(("lumetri-hs", euid, k));
+    let gid = egui::Id::unique(("lumetri-hs", euid, k));
     let resp = ui.interact(gr.expand(6.0), gid, Sense::click_and_drag());
     app.auto.add(&format!("{prefix}.graph"), gr, name);
     let drag_id = gid.with("drag");
@@ -394,7 +399,7 @@ fn huesat_curves(
     if reset_link(app, ui, p, Rect::from_min_size(pos2(gr.max.x - 44.0, gr.max.y + 4.0), vec2(44.0, 18.0)), &format!("{prefix}.reset")) {
         set_str(actions, layer, g, id, String::new(), None);
     }
-    p.text(pos2(gr.min.x, gr.max.y + 13.0), Align2::LEFT_CENTER, "Click adds a point (½ height = no change)", Tokens::ui(10.5), t.text_faint);
+    p.text(pos2(gr.min.x, gr.max.y + 13.0), Align2::LEFT_CENTER, tr("Click adds a point (½ height = no change)"), Tokens::ui(10.5), t.text_faint);
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -437,6 +442,12 @@ fn wheel_point(c: Pos2, radius: f32, phase: f32) -> Pos2 {
     pos2(c.x + radius * a.sin(), c.y - radius * a.cos())
 }
 
+/// Colorama's Output Cycle wheel for effect group `g`: the palette drawn as a ring with its stops.
+/// Clicking the ring adds a stop with the colour there, dragging moves one, and Alt-clicking or
+/// dragging one off removes it while another stop remains; the selected stop's colour can be
+/// edited below. A change queues
+/// the rewritten palette on `actions`, and for a preset palette also switches the effect to the
+/// custom palette in the same undo step.
 #[allow(clippy::too_many_arguments)]
 fn colorama_wheel(
     app: &mut EffectcraftApp,
@@ -458,7 +469,7 @@ fn colorama_wheel(
     let pal = if custom { ColoramaPalette::parse(&str_value(layer, ectx, g, "palette")) } else { None }.unwrap_or_else(|| ColoramaPalette::preset(preset));
     let x0 = r.min.x + 38.0;
     let label = if custom { "Custom palette" } else { effectcraft_engine::effects::COLORAMA_PRESETS.get(preset as usize).copied().unwrap_or("Preset") };
-    p.text(pos2(x0, r.min.y + 15.0), Align2::LEFT_CENTER, format!("Output Cycle: {label}"), Tokens::ui(11.5), t.text_dim);
+    p.text(pos2(x0, r.min.y + 15.0), Align2::LEFT_CENTER, tr_args("Output Cycle: {}", &[&label]), Tokens::ui(11.5), t.text_dim);
     let size = wheel_size(r.width());
     let c = pos2(x0 + size / 2.0, r.min.y + 30.0 + size / 2.0);
     let (outer, inner) = (size / 2.0 - 8.0, size / 2.0 - 26.0);
@@ -472,7 +483,7 @@ fn colorama_wheel(
     }
     p.circle_stroke(c, outer, Stroke::new(1.0, Color32::from_black_alpha(160)));
     p.circle_stroke(c, inner, Stroke::new(1.0, Color32::from_black_alpha(160)));
-    let wid = egui::Id::new(("colorama-wheel", euid));
+    let wid = egui::Id::unique(("colorama-wheel", euid));
     let ring = Rect::from_center_size(c, vec2(outer * 2.0 + 40.0, outer * 2.0 + 40.0));
     let resp = ui.interact(ring, wid, Sense::click_and_drag());
     app.auto.add(&format!("{prefix}.wheel"), ring, "Output Cycle");
@@ -572,9 +583,15 @@ fn colorama_wheel(
             widgets::open_popup(ui, pop);
         }
         app.auto.add(&format!("{prefix}.color"), sr, "Stop color");
-        p.text(pos2(sr.max.x + 8.0, sr.center().y), Align2::LEFT_CENTER, format!("Stop {} at {:.0}°", sel + 1, ph * 360.0), Tokens::ui(11.0), t.text_dim);
+        p.text(
+            pos2(sr.max.x + 8.0, sr.center().y),
+            Align2::LEFT_CENTER,
+            tr_args("Stop {} at {}°", &[&(sel + 1), &format!("{:.0}", ph * 360.0)]),
+            Tokens::ui(11.0),
+            t.text_dim,
+        );
         let mut rgb = [col[0], col[1], col[2]];
-        if crate::header::color_popup(ui, pop, sr.left_bottom(), &mut rgb) {
+        if crate::widgets::color_popup(ui, pop, sr.left_bottom(), &mut rgb) {
             let mut st = pal.stops.clone();
             st[sel].1 = [rgb[0], rgb[1], rgb[2], col[3]];
             new_stops = Some(st);
@@ -583,7 +600,7 @@ fn colorama_wheel(
     p.text(
         pos2(sr.min.x, sr.max.y + 9.0),
         Align2::LEFT_CENTER,
-        "Click the ring to add a colour; Alt-click a stop (or drag it off) to remove it",
+        crate::i18n::tr("Click the ring to add a colour; Alt-click a stop (or drag it off) to remove it"),
         Tokens::ui(10.5),
         t.text_faint,
     );
@@ -647,6 +664,10 @@ pub fn join_map(m: &[fw::CurvePoints; 3]) -> String {
     m.iter().map(|c| c.format()).collect::<Vec<_>>().join(" | ")
 }
 
+/// Glow's Colour Map for effect group `g`: a strip showing the gradient the glow uses (A/B colours,
+/// or the arbitrary map sampled through the loop settings). In arbitrary-map mode it also draws the
+/// RGB curve tabs and the selected channel's graph with a Reset; edits queue a `prop.set` of
+/// `arbitraryMap` on `actions`.
 #[allow(clippy::too_many_arguments)]
 fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, layer: &Layer, g: &PropGroup, ectx: &EvalCtx, r: Rect, actions: &mut Actions) {
     let t = app.tokens;
@@ -687,13 +708,13 @@ fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, laye
     }
     p.rect_stroke(strip, 0.0, Stroke::new(1.0, t.field_border), StrokeKind::Outside);
     app.auto.add(&format!("{prefix}.colorMap"), strip, "Glow colour map");
-    p.text(pos2(strip.max.x + 8.0, strip.center().y), Align2::LEFT_CENTER, "Colour map", Tokens::ui(10.5), t.text_faint);
+    p.text(pos2(strip.max.x + 8.0, strip.center().y), Align2::LEFT_CENTER, tr("Colour map"), Tokens::ui(10.5), t.text_faint);
     if mode != 2 {
         return;
     }
     let ch = app.ui.fx_curve_channel.get(&euid).copied().unwrap_or(0).min(2);
     let cols = [Color32::from_rgb(0xf0, 0x50, 0x50), Color32::from_rgb(0x50, 0xd0, 0x60), Color32::from_rgb(0x50, 0x80, 0xff)];
-    if let Some(n) = tabs(app, ui, p, x0, r.min.y + 15.0, ch, &["Red", "Green", "Blue"], &cols, &format!("{prefix}.channel")) {
+    if let Some(n) = tabs(app, ui, p, pos2(x0, r.min.y + 15.0), ch, (&["Red", "Green", "Blue"], &cols), &format!("{prefix}.channel")) {
         app.ui.fx_curve_channel.insert(euid, n);
     }
     if reset_link(app, ui, p, Rect::from_min_size(pos2(x0 + size - 44.0, r.min.y + 6.0), vec2(44.0, 18.0)), &format!("{prefix}.reset")) {
@@ -702,8 +723,8 @@ fn glow_map(app: &mut EffectcraftApp, ui: &mut egui::Ui, p: &egui::Painter, laye
         set_str(actions, layer, g, "arbitraryMap", join_map(&m), None);
     }
     let gr = Rect::from_min_size(pos2(x0, r.min.y + 30.0), vec2(size, size));
-    let gid = egui::Id::new(("glow-map", euid, ch));
-    let (resp, edit) = fw::curves_graph(ui, gr, &map[ch], ch + 1, false, gid, &t);
+    let gid = egui::Id::unique(("glow-map", euid, ch));
+    let (resp, edit) = fw::curves_graph(ui, gr, &map[ch], ch + 1, fw::CurveMode { pencil: false, natural: false }, gid, &t);
     app.auto.add(&format!("{prefix}.graph"), gr, "Arbitrary Map");
     register_points(app, &prefix, gr, &map[ch].0);
     let key = gesture_key(ui, gid, resp.drag_started() || resp.clicked());
@@ -759,6 +780,10 @@ pub fn add_pair(v: &[(f64, f64)]) -> (f64, f64) {
     ((a.0 + ds * 0.5).rem_euclid(1.0), (a.1 + gap * 0.5).rem_euclid(1.0))
 }
 
+/// Reshape's correspondence buttons: Add Point appends a pair at the widest destination-fraction
+/// gap (or `(0, 0)` for an empty list), Remove Point drops the last stored pair, and Clear removes
+/// all pairs. A status line says whether points are automatic. Each change
+/// queues a `prop.set` of the `correspondencePoints` string on `actions`.
 #[allow(clippy::too_many_arguments)]
 fn reshape_buttons(
     app: &mut EffectcraftApp,
@@ -776,19 +801,19 @@ fn reshape_buttons(
     let b1 = Rect::from_min_size(pos2(r.min.x + 24.0, r.min.y + 4.0), vec2(84.0, 22.0));
     let b2 = Rect::from_min_size(pos2(b1.max.x + 8.0, b1.min.y), vec2(96.0, 22.0));
     let b3 = Rect::from_min_size(pos2(b2.max.x + 8.0, b1.min.y), vec2(56.0, 22.0));
-    if widgets::text_button(ui, b1, "Add Point", false, &t, egui::Id::new(("reshape-add", euid))).clicked() {
+    if widgets::text_button(ui, b1, crate::i18n::tr("Add Point"), false, &t, egui::Id::unique(("reshape-add", euid))).clicked() {
         let mut v = pairs.clone();
         v.push(add_pair(&pairs));
         set_str(actions, layer, g, "correspondencePoints", format_pairs(&v), None);
     }
     app.auto.add(&format!("effectControls.effect.{euid}.reshape.add"), b1, "Add Point");
-    if widgets::text_button(ui, b2, "Remove Point", false, &t, egui::Id::new(("reshape-remove", euid))).clicked() && !pairs.is_empty() {
+    if widgets::text_button(ui, b2, crate::i18n::tr("Remove Point"), false, &t, egui::Id::unique(("reshape-remove", euid))).clicked() && !pairs.is_empty() {
         let mut v = pairs.clone();
         v.pop();
         set_str(actions, layer, g, "correspondencePoints", format_pairs(&v), None);
     }
     app.auto.add(&format!("effectControls.effect.{euid}.reshape.remove"), b2, "Remove Point");
-    if widgets::text_button(ui, b3, "Clear", false, &t, egui::Id::new(("reshape-clear", euid))).clicked() && !pairs.is_empty() {
+    if widgets::text_button(ui, b3, crate::i18n::tr("Clear"), false, &t, egui::Id::unique(("reshape-clear", euid))).clicked() && !pairs.is_empty() {
         set_str(actions, layer, g, "correspondencePoints", String::new(), None);
     }
     app.auto.add(&format!("effectControls.effect.{euid}.reshape.clear"), b3, "Clear");
@@ -844,12 +869,12 @@ fn extractor_layers(
         None => "Custom".to_string(),
     };
     // Lined up with the parameter names and value popups below (Effect Controls' row layout).
-    p.text(pos2(r.min.x + 37.0, r.center().y), Align2::LEFT_CENTER, "Layer", Tokens::ui(12.0), t.text);
+    p.text(pos2(r.min.x + 37.0, r.center().y), Align2::LEFT_CENTER, tr("Layer"), Tokens::ui(12.0), t.text);
     let vx = (r.min.x + r.width() * 0.48).max(r.min.x + 161.0);
     let dr = Rect::from_min_size(pos2(vx, r.center().y - 9.0), vec2((r.max.x - vx - 56.0).clamp(80.0, 200.0), 18.0));
-    let pop = egui::Id::new(("extractor-layers", euid));
-    if widgets::dropdown(ui, dr, &label, &t, egui::Id::new(("extractor-layer", euid)))
-        .on_hover_text("The OpenEXR layer shown in red, green, blue and alpha")
+    let pop = egui::Id::unique(("extractor-layers", euid));
+    if widgets::dropdown(ui, dr, &label, &t, egui::Id::unique(("extractor-layer", euid)))
+        .on_hover_text(tr("The OpenEXR layer shown in red, green, blue and alpha"))
         .clicked()
     {
         widgets::open_popup(ui, pop);
@@ -889,8 +914,8 @@ pub fn channel_popup(
     let t = app.tokens;
     let uid = prop.uid;
     let label = if cur.trim().is_empty() { NO_CHANNEL } else { cur };
-    let pop = egui::Id::new(("ec-chpop", uid));
-    if widgets::dropdown(ui, r, label, &t, egui::Id::new(("ec-ch", uid))).clicked() {
+    let pop = egui::Id::unique(("ec-chpop", uid));
+    if widgets::dropdown(ui, r, label, &t, egui::Id::unique(("ec-ch", uid))).clicked() {
         widgets::open_popup(ui, pop);
     }
     app.auto.add(&format!("effectControls.prop.{uid}.value"), r, &prop.name);
@@ -982,7 +1007,7 @@ pub fn reshape_overlay(
         painter.line_segment([ps, pd], Stroke::new(1.0, Color32::from_white_alpha(150)));
         for (end, s, col) in [(0usize, ps, ys), (1, pd, cs)] {
             let hr = Rect::from_center_size(s, vec2(12.0, 12.0));
-            let id = egui::Id::new(("reshape-pt", g.uid, i, end));
+            let id = egui::Id::unique(("reshape-pt", g.uid, i, end));
             let resp = ui.interact(hr, id, Sense::drag());
             let hot = resp.hovered() || resp.dragged();
             painter.rect_filled(Rect::from_center_size(s, vec2(7.0, 7.0)), 0.0, if hot { Color32::WHITE } else { col });
@@ -1011,9 +1036,108 @@ pub fn reshape_overlay(
     }
 }
 
+/// Mesh Warp's grid: (rows, columns, vertex offsets in layer pixels, row-major). A stored mesh
+/// that doesn't match the grid (Rows or Columns changed since) reads as undistorted, as it
+/// renders.
+fn mesh_grid(layer: &Layer, ectx: &EvalCtx, g: &PropGroup) -> (usize, usize, Vec<(f64, f64)>) {
+    let n = |id: &str| {
+        let v = g.get(id).map(|p| ectx.value(layer, p).as_f64()).unwrap_or(7.0);
+        if v.is_finite() { v.round().clamp(1.0, 31.0) as usize } else { 7 }
+    };
+    let (rows, cols) = (n("rows"), n("columns"));
+    let count = (rows + 1) * (cols + 1);
+    let mut offs = effectcraft_engine::effects::parse_mesh(&str_value(layer, ectx, g, "mesh"));
+    if offs.len() != count {
+        offs = vec![(0.0, 0.0); count];
+    }
+    (rows, cols, offs)
+}
+
+/// The `mesh` parameter's text for these offsets (the inverse of `parse_mesh`).
+fn format_mesh(offs: &[(f64, f64)]) -> String {
+    let r = |v: f64| if v.is_finite() { (v * 1000.0).round() / 1000.0 + 0.0 } else { 0.0 };
+    offs.iter().map(|o| format!("{},{}", r(o.0), r(o.1))).collect::<Vec<_>>().join(" ")
+}
+
+/// Mesh Warp on the Composition viewer (#303): the distortion mesh's grid over the layer, with
+/// a handle on every vertex. Dragging a vertex moves it (its offset in the hidden `mesh`
+/// parameter; the first drag of an undistorted mesh writes the whole grid). `fm` maps effect
+/// space to comp.
+#[allow(clippy::too_many_arguments)]
+pub fn mesh_warp_overlay(
+    app: &mut EffectcraftApp,
+    ui: &mut egui::Ui,
+    painter: &egui::Painter,
+    map: &super::viewer::ViewerMap,
+    ectx: &EvalCtx,
+    layer: &Layer,
+    g: &PropGroup,
+    fm: &Mat3,
+    actions: &mut Actions,
+) {
+    let (rows, cols, offs) = mesh_grid(layer, ectx, g);
+    let [lw, lh] = ectx.effect_bounds(layer).0;
+    let rest = |k: usize| [(k % (cols + 1)) as f64 / cols as f64 * lw, (k / (cols + 1)) as f64 / rows as f64 * lh];
+    let screen: Vec<Pos2> = offs
+        .iter()
+        .enumerate()
+        .map(|(k, o)| {
+            let r = rest(k);
+            map.to_screen(fw::layer_to_comp(fm, [r[0] + o.0, r[1] + o.1]))
+        })
+        .collect();
+    let line = Stroke::new(1.0, Color32::from_white_alpha(150));
+    for (k, s) in screen.iter().enumerate() {
+        if k % (cols + 1) < cols
+            && let Some(e) = screen.get(k + 1)
+        {
+            painter.line_segment([*s, *e], line);
+        }
+        if let Some(e) = screen.get(k + cols + 1) {
+            painter.line_segment([*s, *e], line);
+        }
+    }
+    let ctx = ui.ctx().clone();
+    let accent = app.tokens.accent;
+    for (k, s) in screen.iter().enumerate() {
+        let hr = Rect::from_center_size(*s, vec2(10.0, 10.0));
+        let id = egui::Id::unique(("mesh-warp-vertex", g.uid, k));
+        let resp = ui.interact(hr, id, Sense::drag());
+        let hot = resp.hovered() || resp.dragged();
+        let dot = Rect::from_center_size(*s, vec2(5.0, 5.0));
+        painter.rect_filled(dot, 0.0, if hot { accent } else { Color32::WHITE });
+        painter.rect_stroke(dot, 0.0, Stroke::new(1.0, Color32::BLACK), StrokeKind::Outside);
+        let (row, col) = (k / (cols + 1), k % (cols + 1));
+        app.auto.add(&format!("viewer.meshWarp.{}.{row}.{col}", g.uid), hr, &format!("Mesh vertex (row {row}, column {col})"));
+        if hot {
+            ctx.set_cursor_icon(egui::CursorIcon::Move);
+        }
+        if resp.dragged()
+            && let Some(pos) = resp.interact_pointer_pos()
+            && let Some(lp) = fw::comp_to_layer(fm, map.to_comp(pos))
+        {
+            let mut v = offs.clone();
+            let r = rest(k);
+            if let Some(o) = v.get_mut(k) {
+                *o = (lp[0] - r[0], lp[1] - r[1]);
+            }
+            let key = gesture_key(ui, id, resp.drag_started());
+            set_str(actions, layer, g, "mesh", format_mesh(&v), Some(key));
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn mesh_text_round_trips() {
+        let offs = vec![(0.0, 0.0), (12.5, -3.25), (1.0 / 3.0, f64::NAN)];
+        let s = format_mesh(&offs);
+        assert_eq!(s, "0,0 12.5,-3.25 0.333,0");
+        assert_eq!(effectcraft_engine::effects::parse_mesh(&s), vec![(0.0, 0.0), (12.5, -3.25), (0.333, 0.0)]);
+    }
 
     #[test]
     fn offset_points_and_palettes_round_trip() {
