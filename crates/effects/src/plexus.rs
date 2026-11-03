@@ -21,6 +21,15 @@
 //!   Opacity and thickness fall off over distance. Facets fill the triangles whose three sides
 //!   are all within Facet Max Distance. Everything is drawn far to near, antialiased, in parallel
 //!   bands, Normal or Add, over the layer or on its own.
+//! * **More effectors** (after Noise, before Transform): Loop Noise crossfades the evolution so
+//!   it repeats every Loop Duration; a Spherical Field pushes or pulls the points within a
+//!   radius and tints and scales them; a Container keeps them inside a box or ellipsoid; a
+//!   Color Map samples a layer at each point for colour, size and depth.
+//! * **Visibility**: points, lines and facets fade in past Near Fade and out towards Far Fade
+//!   (distance from the camera), and facets facing away from or towards the camera can be hidden.
+//! * **Beams** draw a line from every Nth point to a target point in 3D.
+//! * **Depth of Field** widens and softens what is away from Focus Distance; **Motion Blur**
+//!   renders several moments across the shutter (the comp's, or a custom angle) and averages them.
 
 use effectcraft_color::luminance;
 use effectcraft_keyframe::Value;
@@ -40,15 +49,25 @@ pub const GROUPS: &[(&str, &str)] = &[
     ("plxNoise", "Noise Effector"),
     ("plxTransform", "Transform Effector"),
     ("plxColor", "Color Effector"),
+    ("plxField", "Spherical Field"),
+    ("plxContainer", "Container"),
+    ("plxColorMap", "Color Map"),
     ("plxCamera", "Camera"),
     ("plxPoints", "Points"),
     ("plxLines", "Lines"),
     ("plxFacets", "Facets"),
+    ("plxBeams", "Beams"),
+    ("plxMotionBlur", "Motion Blur"),
 ];
 
 const SOURCES: &[&str] = &["Random in Box", "Random in Sphere", "Sphere Surface", "Grid", "Layer Pixels", "Along Masks"];
 const FALLOFFS: &[&str] = &["None", "Linear", "Smooth", "Strong"];
 const COLOR_MODES: &[&str] = &["Single Color", "Depth Gradient", "Random Between Colors", "Source Pixels"];
+const CONTAINERS: &[&str] = &["None", "Box", "Ellipsoid"];
+const CULL: &[&str] = &["None", "Facing Away", "Facing Camera"];
+const BLUR_MODES: &[&str] = &["Off", "Comp Shutter", "Custom Shutter"];
+/// Most motion blur samples.
+const MAX_BLUR_SAMPLES: u32 = 16;
 
 /// Most points the geometry makes.
 pub const MAX_POINTS: usize = 20_000;
@@ -84,6 +103,8 @@ pub fn specs() -> Vec<EffectSpec> {
         p("plxNoise/scale", "Noise Scale", num(300.0), slider(1.0, 10_000.0, 10.0, 1000.0, 1)),
         p("plxNoise/speed", "Evolution Speed", num(0.3), slider(0.0, 100.0, 0.0, 5.0, 2)),
         p("plxNoise/amountZ", "Z Amount", num(100.0), slider(0.0, 400.0, 0.0, 200.0, 1)),
+        p("plxNoise/loop", "Loop Noise", Value::Bool(false), ParamUi::Checkbox),
+        p("plxNoise/loopDuration", "Loop Duration (s)", num(4.0), slider(0.01, 10_000.0, 0.5, 30.0, 2)),
         // Transform effector
         p("plxTransform/rotationX", "X Rotation", num(0.0), ParamUi::Angle),
         p("plxTransform/rotationY", "Y Rotation", num(0.0), ParamUi::Angle),
@@ -97,9 +118,34 @@ pub fn specs() -> Vec<EffectSpec> {
         p("plxColor/colorA", "Color (Near)", col(0.55, 0.85, 1.0), ParamUi::Color),
         p("plxColor/colorB", "Color (Far)", col(0.25, 0.3, 0.9), ParamUi::Color),
         p("plxColor/depthFade", "Depth Fade", num(60.0), pct()),
+        // Spherical field
+        p("plxField/on", "Enable Field", Value::Bool(false), ParamUi::Checkbox),
+        p("plxField/center", "Field Center", Value::Vec2([0.5, 0.5]), ParamUi::Point),
+        p("plxField/centerZ", "Field Center Z", num(0.0), slider(-100_000.0, 100_000.0, -1000.0, 1000.0, 1)),
+        p("plxField/radius", "Radius", num(150.0), slider(0.0, 100_000.0, 0.0, 1000.0, 1)),
+        p("plxField/falloff", "Falloff", Value::Enum(2), popup(FALLOFFS)),
+        p("plxField/strength", "Push (px)", num(60.0), slider(-100_000.0, 100_000.0, -300.0, 300.0, 1)),
+        p("plxField/scale", "Point Scale Inside", num(100.0), slider(0.0, 1000.0, 0.0, 400.0, 1)),
+        p("plxField/color", "Field Color", col(1.0, 0.45, 0.3), ParamUi::Color),
+        p("plxField/colorAmount", "Color Amount", num(0.0), pct()),
+        // Container
+        p("plxContainer/shape", "Container", Value::Enum(0), popup(CONTAINERS)),
+        p("plxContainer/scale", "Container Size", num(100.0), slider(0.0, 1000.0, 0.0, 200.0, 1)),
+        // Color map
+        p("plxColorMap/layer", "Color Map Layer", Value::Layer(None), ParamUi::Layer),
+        p("plxColorMap/colorAmount", "Color Amount", num(100.0), pct()),
+        p("plxColorMap/scaleAmount", "Size by Luminance", num(0.0), slider(0.0, 1000.0, 0.0, 400.0, 1)),
+        p("plxColorMap/displaceZ", "Z Displace by Luminance", num(0.0), slider(-100_000.0, 100_000.0, -500.0, 500.0, 1)),
         // Camera
         p("plxCamera/useComp", "Use Comp Camera", Value::Bool(true), ParamUi::Checkbox),
         p("plxCamera/fov", "Angle of View", num(39.6), slider(1.0, 170.0, 10.0, 120.0, 1)),
+        p("plxCamera/nearStart", "Near Fade Start", num(0.0), slider(0.0, 1_000_000.0, 0.0, 2000.0, 1)),
+        p("plxCamera/nearEnd", "Near Fade End", num(0.0), slider(0.0, 1_000_000.0, 0.0, 2000.0, 1)),
+        p("plxCamera/farStart", "Far Fade Start", num(0.0), slider(0.0, 1_000_000.0, 0.0, 5000.0, 1)),
+        p("plxCamera/farEnd", "Far Fade End", num(0.0), slider(0.0, 1_000_000.0, 0.0, 5000.0, 1)),
+        p("plxCamera/dof", "Depth of Field", Value::Bool(false), ParamUi::Checkbox),
+        p("plxCamera/focus", "Focus Distance", num(1300.0), slider(1.0, 1_000_000.0, 100.0, 5000.0, 1)),
+        p("plxCamera/aperture", "Blur Amount", num(8.0), slider(0.0, 1000.0, 0.0, 50.0, 1)),
         // Points
         p("plxPoints/on", "Render Points", Value::Bool(true), ParamUi::Checkbox),
         p("plxPoints/size", "Point Size", num(4.0), slider(0.0, 500.0, 0.0, 30.0, 1)),
@@ -117,13 +163,31 @@ pub fn specs() -> Vec<EffectSpec> {
         p("plxLines/thicknessFalloff", "Thickness over Distance", Value::Enum(0), popup(FALLOFFS)),
         p("plxLines/useVertexColors", "Use Vertex Colors", Value::Bool(true), ParamUi::Checkbox),
         p("plxLines/color", "Line Color", col(1.0, 1.0, 1.0), ParamUi::Color),
+        p("plxLines/colorByLength", "Color by Length", Value::Bool(false), ParamUi::Checkbox),
+        p("plxLines/farColor", "Long Line Color", col(0.9, 0.3, 0.8), ParamUi::Color),
         // Facets
         p("plxFacets/on", "Render Facets", Value::Bool(false), ParamUi::Checkbox),
         p("plxFacets/maxDistance", "Facet Max Distance", num(110.0), slider(0.0, 100_000.0, 0.0, 600.0, 1)),
+        p("plxFacets/minDistance", "Facet Min Distance", num(0.0), slider(0.0, 100_000.0, 0.0, 600.0, 1)),
         p("plxFacets/opacity", "Facet Opacity", num(20.0), pct()),
         p("plxFacets/opacityFalloff", "Opacity over Distance", Value::Bool(true), ParamUi::Checkbox),
         p("plxFacets/useVertexColors", "Use Vertex Colors", Value::Bool(true), ParamUi::Checkbox),
         p("plxFacets/color", "Facet Color", col(0.4, 0.6, 1.0), ParamUi::Color),
+        p("plxFacets/colorBySize", "Color by Size", Value::Bool(false), ParamUi::Checkbox),
+        p("plxFacets/farColor", "Large Facet Color", col(0.9, 0.3, 0.8), ParamUi::Color),
+        p("plxFacets/cull", "Hide Facets", Value::Enum(0), popup(CULL)),
+        // Beams
+        p("plxBeams/on", "Render Beams", Value::Bool(false), ParamUi::Checkbox),
+        p("plxBeams/target", "Beam Target", Value::Vec2([0.5, 0.5]), ParamUi::Point),
+        p("plxBeams/targetZ", "Beam Target Z", num(0.0), slider(-100_000.0, 100_000.0, -1000.0, 1000.0, 1)),
+        p("plxBeams/every", "Every Nth Point", num(10.0), slider(1.0, MAX_POINTS as f64, 1.0, 50.0, 0)),
+        p("plxBeams/thickness", "Beam Thickness", num(1.0), slider(0.0, 100.0, 0.0, 10.0, 2)),
+        p("plxBeams/opacity", "Beam Opacity", num(50.0), pct()),
+        p("plxBeams/color", "Beam Color (Target)", col(1.0, 1.0, 1.0), ParamUi::Color),
+        // Motion blur
+        p("plxMotionBlur/mode", "Motion Blur", Value::Enum(0), popup(BLUR_MODES)),
+        p("plxMotionBlur/angle", "Shutter Angle", num(180.0), slider(0.0, 720.0, 0.0, 360.0, 1)),
+        p("plxMotionBlur/samples", "Samples", num(8.0), slider(2.0, f64::from(MAX_BLUR_SAMPLES), 2.0, 16.0, 0)),
         // Output
         p("blendMode", "Blend Mode", Value::Enum(0), popup(&["Normal", "Add"])),
         p("composite", "Composite on Original", Value::Bool(true), ParamUi::Checkbox),
@@ -206,6 +270,17 @@ struct Vertex {
     pos: [f64; 3],
     color: Option<[f32; 3]>,
     rand: f64,
+    /// Point size multiplier (fields, colour map).
+    size: f64,
+    /// Colour Map tint and Spherical Field tint (colour, weight), applied in that order.
+    map_tint: Option<([f32; 3], f32)>,
+    field_tint: Option<([f32; 3], f32)>,
+}
+
+impl Vertex {
+    fn new(pos: [f64; 3], color: Option<[f32; 3]>, rand: f64) -> Vertex {
+        Vertex { pos, color, rand, size: 1.0, map_tint: None, field_tint: None }
+    }
 }
 
 fn geometry(ctx: &EffectCtx, b: &Buf) -> Vec<Vertex> {
@@ -229,7 +304,7 @@ fn geometry(ctx: &EffectCtx, b: &Buf) -> Vec<Vertex> {
                 let q = [rng.next() * 2.0 - 1.0, rng.next() * 2.0 - 1.0, rng.next() * 2.0 - 1.0];
                 if q[0] * q[0] + q[1] * q[1] + q[2] * q[2] <= 1.0 {
                     let r = rng.next();
-                    pts.push(Vertex { pos: at(q[0] * sw * 0.5, q[1] * sh * 0.5, q[2] * sd * 0.5), color: None, rand: r });
+                    pts.push(Vertex::new(at(q[0] * sw * 0.5, q[1] * sh * 0.5, q[2] * sd * 0.5), None, r));
                 }
             }
         }
@@ -239,7 +314,7 @@ fn geometry(ctx: &EffectCtx, b: &Buf) -> Vec<Vertex> {
                 let y = 1.0 - 2.0 * (i as f64 + 0.5) / count as f64;
                 let r = (1.0 - y * y).max(0.0).sqrt();
                 let th = golden * i as f64;
-                pts.push(Vertex { pos: at(r * th.cos() * sw * 0.5, y * sh * 0.5, r * th.sin() * sd * 0.5), color: None, rand: rng.next() });
+                pts.push(Vertex::new(at(r * th.cos() * sw * 0.5, y * sh * 0.5, r * th.sin() * sd * 0.5), None, rng.next()));
             }
         }
         3 => {
@@ -252,7 +327,7 @@ fn geometry(ctx: &EffectCtx, b: &Buf) -> Vec<Vertex> {
                         if pts.len() >= MAX_POINTS {
                             break 'grid;
                         }
-                        pts.push(Vertex { pos: at(step(cols, sw, i), step(rows, sh, j), step(layers, sd, k)), color: None, rand: rng.next() });
+                        pts.push(Vertex::new(at(step(cols, sw, i), step(rows, sh, j), step(layers, sd, k)), None, rng.next()));
                     }
                 }
             }
@@ -262,7 +337,7 @@ fn geometry(ctx: &EffectCtx, b: &Buf) -> Vec<Vertex> {
         _ => {
             for _ in 0..count {
                 let q = [rng.next() - 0.5, rng.next() - 0.5, rng.next() - 0.5];
-                pts.push(Vertex { pos: at(q[0] * sw, q[1] * sh, q[2] * sd), color: None, rand: rng.next() });
+                pts.push(Vertex::new(at(q[0] * sw, q[1] * sh, q[2] * sd), None, rng.next()));
             }
         }
     }
@@ -304,7 +379,7 @@ fn layer_points(ctx: &EffectCtx, b: &Buf, count: usize, depth: f64, cz: f64, rng
         let (bx, by) = ((i % w) as f64 + rng.next(), (i / w) as f64 + rng.next());
         let (c, _) = img.data.get(i).map(|&p| unpremul(p)).unwrap_or(([1.0; 3], 1.0));
         let pos = [(bx - b.offset[0]) / s, (by - b.offset[1]) / s, cz + (rng.next() - 0.5) * depth];
-        pts.push(Vertex { pos, color: Some(c.map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 })), rand: rng.next() });
+        pts.push(Vertex::new(pos, Some(c.map(|v| if v.is_finite() { v.max(0.0) } else { 0.0 })), rng.next()));
     }
 }
 
@@ -340,7 +415,7 @@ fn mask_points(ctx: &EffectCtx, count: usize, depth: f64, cz: f64, rng: &mut Rng
         }
         let Some(&(a, b, len)) = segs.get(si).or(segs.last()) else { break };
         let t = (want / len).clamp(0.0, 1.0);
-        pts.push(Vertex { pos: [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, cz + (rng.next() - 0.5) * depth], color: None, rand: rng.next() });
+        pts.push(Vertex::new([a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t, cz + (rng.next() - 0.5) * depth], None, rng.next()));
     }
 }
 
@@ -356,26 +431,49 @@ struct Seen {
     world: [f64; 3],
     color: [f32; 3],
     alpha: f32,
+    /// Point size multiplier.
+    size: f32,
+    /// Depth of field blur radius, buffer pixels.
+    blur: f32,
 }
 
-fn effectors(ctx: &EffectCtx, pts: &mut [Vertex]) {
+/// Noise displacement of a point at evolution `ev`.
+fn noise_offset(p: [f64; 3], scale: f64, ev: f64, seed: u64) -> [f64; 3] {
+    let q = [p[0] / scale, p[1] / scale, p[2] / scale + ev];
+    [0u64, 1, 2].map(|k| noise3([q[0] + k as f64 * 31.7, q[1] - k as f64 * 17.3, q[2] + ev * 0.37], seed ^ k))
+}
+
+fn effectors(ctx: &EffectCtx, b: &Buf, pts: &mut [Vertex], t: f64) {
     let c = ctx.params.v2("plxGeometry/center");
     let c = if c.iter().all(|v| v.is_finite()) { c } else { [ctx.layer_size[0] * 0.5, ctx.layer_size[1] * 0.5] };
     let cz = fv(ctx, "plxGeometry/centerZ", 0.0);
-    let t = if ctx.time.is_finite() { ctx.time } else { 0.0 };
+    let t = if t.is_finite() { t.clamp(-1e7, 1e7) } else { 0.0 };
     // Noise.
     let amp = fv(ctx, "plxNoise/amount", 40.0).max(0.0);
     if amp > 0.0 {
         let scale = fv(ctx, "plxNoise/scale", 300.0).max(1.0);
-        let ev = t * fv(ctx, "plxNoise/speed", 0.3);
+        let speed = fv(ctx, "plxNoise/speed", 0.3).clamp(-1e4, 1e4);
         let zf = fv(ctx, "plxNoise/amountZ", 100.0).max(0.0) / 100.0;
         let seed = mix64(u64::from(ctx.seed) ^ 0x006E_015E);
+        // Loop Noise: crossfade between this pass and the one a loop earlier, so the motion at
+        // the end of each loop meets its start.
+        let lp = ctx.params.b("plxNoise/loop").then(|| fv(ctx, "plxNoise/loopDuration", 4.0).clamp(0.01, 1e4));
         pts.par_iter_mut().for_each(|v| {
-            let q = [v.pos[0] / scale, v.pos[1] / scale, v.pos[2] / scale + ev];
-            let d = [0u64, 1, 2].map(|k| noise3([q[0] + k as f64 * 31.7, q[1] - k as f64 * 17.3, q[2] + ev * 0.37], seed ^ k));
+            let d = match lp {
+                Some(period) => {
+                    let u = t.rem_euclid(period);
+                    let w = u / period;
+                    let (a, z) = (noise_offset(v.pos, scale, u * speed, seed), noise_offset(v.pos, scale, (u - period) * speed, seed));
+                    [0, 1, 2].map(|k| a[k] * (1.0 - w) + z[k] * w)
+                }
+                None => noise_offset(v.pos, scale, t * speed, seed),
+            };
             v.pos = [v.pos[0] + d[0] * amp, v.pos[1] + d[1] * amp, v.pos[2] + d[2] * amp * zf];
         });
     }
+    field(ctx, pts);
+    container(ctx, c, cz, pts);
+    color_map(ctx, b, pts);
     // Transform about Center.
     let deg = |id: &str| fv(ctx, &format!("plxTransform/rotation{id}"), 0.0) + fv(ctx, &format!("plxTransform/spin{id}"), 0.0) * t;
     let r = rot3([deg("X").to_radians(), deg("Y").to_radians(), deg("Z").to_radians()]);
@@ -386,6 +484,103 @@ fn effectors(ctx: &EffectCtx, pts: &mut [Vertex]) {
             let q = r.map(|row| (row[0] * d[0] + row[1] * d[1] + row[2] * d[2]) * k);
             v.pos = [c[0] + q[0], c[1] + q[1], cz + q[2]];
         }
+    }
+}
+
+/// Spherical Field: within Radius of its centre, points are pushed outwards (pulled in when
+/// negative), scaled and tinted, by the falloff from the centre (1) to the radius (0).
+fn field(ctx: &EffectCtx, pts: &mut [Vertex]) {
+    if !ctx.params.b("plxField/on") {
+        return;
+    }
+    let c = ctx.params.v2("plxField/center");
+    let c = if c.iter().all(|v| v.is_finite()) { c } else { [ctx.layer_size[0] * 0.5, ctx.layer_size[1] * 0.5] };
+    let center = [c[0], c[1], fv(ctx, "plxField/centerZ", 0.0)];
+    let radius = fv(ctx, "plxField/radius", 150.0).max(0.0);
+    if radius <= 0.0 {
+        return;
+    }
+    let kind = ctx.params.e("plxField/falloff");
+    let push = fv(ctx, "plxField/strength", 60.0).clamp(-1e5, 1e5);
+    let scale = fv(ctx, "plxField/scale", 100.0).clamp(0.0, 1000.0) / 100.0;
+    let tint = finite_color(ctx.params.color("plxField/color"));
+    let amount = (fv(ctx, "plxField/colorAmount", 0.0) / 100.0).clamp(0.0, 1.0) as f32;
+    for v in pts.iter_mut() {
+        let d = [v.pos[0] - center[0], v.pos[1] - center[1], v.pos[2] - center[2]];
+        let len = (d[0] * d[0] + d[1] * d[1] + d[2] * d[2]).sqrt();
+        if len.is_nan() || len >= radius {
+            continue;
+        }
+        let w = if kind == 0 { 1.0 } else { falloff(kind, len / radius) };
+        // A point right at the centre goes up (any direction would do; this one is stable).
+        let n = if len > 1e-9 { d.map(|x| x / len) } else { [0.0, -1.0, 0.0] };
+        v.pos = [0, 1, 2].map(|k| v.pos[k] + n[k] * push * w);
+        v.size *= 1.0 + (scale - 1.0) * w;
+        if amount > 0.0 {
+            v.field_tint = Some((tint, amount * w as f32));
+        }
+    }
+}
+
+/// Container: points outside a box or ellipsoid (the geometry's size around Center, scaled)
+/// are moved back onto its surface.
+fn container(ctx: &EffectCtx, c: [f64; 2], cz: f64, pts: &mut [Vertex]) {
+    let shape = ctx.params.e("plxContainer/shape");
+    if shape == 0 || shape > 2 {
+        return;
+    }
+    let [lw, lh] = ctx.layer_size;
+    let k = fv(ctx, "plxContainer/scale", 100.0).clamp(0.0, 1000.0) / 100.0;
+    let half = [
+        lw * fv(ctx, "plxGeometry/width", 100.0).max(0.0) / 200.0 * k,
+        lh * fv(ctx, "plxGeometry/height", 100.0).max(0.0) / 200.0 * k,
+        fv(ctx, "plxGeometry/depth", 400.0).max(0.0) / 2.0 * k,
+    ];
+    let o = [c[0], c[1], cz];
+    for v in pts.iter_mut() {
+        let d = [0, 1, 2].map(|i| v.pos[i] - o[i]);
+        let q = if shape == 1 {
+            [0, 1, 2].map(|i| d[i].clamp(-half[i], half[i]))
+        } else {
+            // Scale into the unit sphere, clamp the radius, scale back.
+            let u = [0, 1, 2].map(|i| if half[i] > 1e-9 { d[i] / half[i] } else { 0.0 });
+            let r = (u[0] * u[0] + u[1] * u[1] + u[2] * u[2]).sqrt();
+            if r > 1.0 { [0, 1, 2].map(|i| u[i] / r * half[i]) } else { [0, 1, 2].map(|i| if half[i] > 1e-9 { d[i] } else { 0.0 }) }
+        };
+        if q.iter().all(|x| x.is_finite()) {
+            v.pos = [o[0] + q[0], o[1] + q[1], o[2] + q[2]];
+        }
+    }
+}
+
+/// Color Map: each point samples the layer under it (its x and y, before the transform) for
+/// a tint, a size by luminance and a push in z by luminance.
+fn color_map(ctx: &EffectCtx, b: &Buf, pts: &mut [Vertex]) {
+    let Some(other) = ctx.layer_param("plxColorMap/layer", true) else { return };
+    let img = crate::util::fit_layer(ctx, b, &other, false);
+    if img.width == 0 || img.height == 0 {
+        return;
+    }
+    let amount = (fv(ctx, "plxColorMap/colorAmount", 100.0) / 100.0).clamp(0.0, 1.0) as f32;
+    let size = fv(ctx, "plxColorMap/scaleAmount", 0.0).clamp(0.0, 1000.0) / 100.0;
+    let dz = fv(ctx, "plxColorMap/displaceZ", 0.0).clamp(-1e5, 1e5);
+    let s = b.scale;
+    for v in pts.iter_mut() {
+        let (x, y) = (v.pos[0] * s + b.offset[0], v.pos[1] * s + b.offset[1]);
+        if !(x.is_finite() && y.is_finite()) {
+            continue;
+        }
+        let (c, a) = unpremul(crate::util::sample(&img, x, y, true));
+        let c = c.map(|q| if q.is_finite() { q.clamp(0.0, 1.0) } else { 0.0 });
+        let l = f64::from(luminance(c[0], c[1], c[2]) * if a.is_finite() { a.clamp(0.0, 1.0) } else { 0.0 });
+        if amount > 0.0 && a > 0.0 {
+            v.map_tint = Some((c, amount * a.clamp(0.0, 1.0)));
+        }
+        if size > 0.0 {
+            v.size *= 1.0 + size * (l - 0.5) * 2.0;
+            v.size = v.size.max(0.0);
+        }
+        v.pos[2] += dz * l;
     }
 }
 
@@ -432,7 +627,7 @@ fn project(ctx: &EffectCtx, b: &Buf, pts: &[Vertex]) -> Vec<Option<Seen>> {
         .iter()
         .map(|v| {
             let (xy, depth, scale) = cam.see([v.pos[0] * s + b.offset[0], v.pos[1] * s + b.offset[1], v.pos[2] * s])?;
-            Some(Seen { xy, depth, scale, world: v.pos, color: [1.0; 3], alpha: 1.0 })
+            Some(Seen { xy, depth, scale, world: v.pos, color: [1.0; 3], alpha: 1.0, size: v.size.clamp(0.0, 1e4) as f32, blur: 0.0 })
         })
         .collect();
     // Colour and depth fade, by depth across the visible points.
@@ -443,18 +638,72 @@ fn project(ctx: &EffectCtx, b: &Buf, pts: &[Vertex]) -> Vec<Option<Seen>> {
     let mode = ctx.params.e("plxColor/mode");
     let fade = (fv(ctx, "plxColor/depthFade", 60.0) / 100.0).clamp(0.0, 1.0) as f32;
     let lerp = |t: f32| [0, 1, 2].map(|i| a[i] + (bcol[i] - a[i]) * t);
+    let tint = |c: [f32; 3], t: Option<([f32; 3], f32)>| match t {
+        Some((q, w)) => {
+            let w = w.clamp(0.0, 1.0);
+            [0, 1, 2].map(|i| c[i] + (q[i] - c[i]) * w)
+        }
+        None => c,
+    };
+    let vis = Visibility::new(ctx, b.scale);
     for (s, v) in seen.iter_mut().zip(pts) {
         let Some(s) = s else { continue };
         let t = ((s.depth - lo) / span) as f32;
-        s.color = match mode {
+        let base = match mode {
             1 => lerp(t),
             2 => lerp(v.rand as f32),
             3 => v.color.unwrap_or(a),
             _ => a,
         };
-        s.alpha = 1.0 - fade * t;
+        s.color = tint(tint(base, v.map_tint), v.field_tint);
+        s.alpha = (1.0 - fade * t) * vis.fade(s.depth);
+        s.blur = vis.blur(s.depth);
     }
     seen
+}
+
+/// Near / far fades and depth of field, by distance from the camera (buffer pixels).
+struct Visibility {
+    near: Option<(f64, f64)>,
+    far: Option<(f64, f64)>,
+    /// Focus distance and blur per unit of relative defocus, buffer pixels.
+    dof: Option<(f64, f64)>,
+}
+
+impl Visibility {
+    fn new(ctx: &EffectCtx, scale: f64) -> Visibility {
+        let d = |id: &str| fv(ctx, &format!("plxCamera/{id}"), 0.0).clamp(0.0, 1e7) * scale;
+        let (ns, ne, fs, fe) = (d("nearStart"), d("nearEnd"), d("farStart"), d("farEnd"));
+        let focus = fv(ctx, "plxCamera/focus", 1300.0).clamp(1.0, 1e7) * scale;
+        let ap = fv(ctx, "plxCamera/aperture", 8.0).clamp(0.0, 1000.0) * scale;
+        Visibility {
+            near: (ne > 0.0).then_some((ns.min(ne), ne)),
+            far: (fe > 0.0).then_some((fs.min(fe), fe)),
+            dof: (ctx.params.b("plxCamera/dof") && ap > 0.0).then_some((focus.max(1e-9), ap)),
+        }
+    }
+
+    fn fade(&self, depth: f64) -> f32 {
+        let ramp = |a: f64, b: f64, x: f64| {
+            if b > a {
+                ((x - a) / (b - a)).clamp(0.0, 1.0)
+            } else if x >= b {
+                1.0
+            } else {
+                0.0
+            }
+        };
+        let n = self.near.map_or(1.0, |(s, e)| ramp(s, e, depth));
+        let f = self.far.map_or(1.0, |(s, e)| 1.0 - ramp(s, e, depth));
+        let v = (n * f) as f32;
+        if v.is_finite() { v } else { 0.0 }
+    }
+
+    fn blur(&self, depth: f64) -> f32 {
+        let Some((focus, ap)) = self.dof else { return 0.0 };
+        let b = (ap * (depth - focus).abs() / focus).min(500.0) as f32;
+        if b.is_finite() { b } else { 0.0 }
+    }
 }
 
 // ------------------------------------------------------------------ connections
@@ -697,14 +946,52 @@ fn premul_rgb(c: [f32; 3], a: f32) -> Px {
     [c[0] * a, c[1] * a, c[2] * a, a]
 }
 
-fn plexus(ctx: &EffectCtx, b: Buf) -> Buf {
-    let (w, h) = (b.img.width as usize, b.img.height as usize);
-    if w == 0 || h == 0 || b.img.data.len() != w * h {
-        return b;
+/// A colour pulled towards `far` by `t` (0..1).
+fn towards(c: [f32; 3], far: Option<[f32; 3]>, t: f64) -> [f32; 3] {
+    match far {
+        Some(f) => {
+            let t = t.clamp(0.0, 1.0) as f32;
+            [0, 1, 2].map(|i| c[i] + (f[i] - c[i]) * t)
+        }
+        None => c,
     }
-    let mut pts = geometry(ctx, &b);
-    effectors(ctx, &mut pts);
-    let seen = project(ctx, &b, &pts);
+}
+
+/// Where layer-space point `p` lands in the buffer through the effect's camera.
+fn see_point(ctx: &EffectCtx, b: &Buf, p: [f64; 3]) -> Option<([f64; 2], f64, f64)> {
+    let s = b.scale;
+    Camera::new(ctx, b).see([p[0] * s + b.offset[0], p[1] * s + b.offset[1], p[2] * s])
+}
+
+/// Whether a facet is hidden by Hide Facets: its normal is turned to point away from Center
+/// (the cloud's middle), then compared with the direction to the camera.
+fn culled(ctx: &EffectCtx, b: &Buf, mode: u32, tri: [&Seen; 3]) -> bool {
+    if mode == 0 {
+        return false;
+    }
+    let [p, q, r] = tri.map(|v| v.world);
+    let (u, v) = ([q[0] - p[0], q[1] - p[1], q[2] - p[2]], [r[0] - p[0], r[1] - p[1], r[2] - p[2]]);
+    let mut n = [u[1] * v[2] - u[2] * v[1], u[2] * v[0] - u[0] * v[2], u[0] * v[1] - u[1] * v[0]];
+    let mid = [0, 1, 2].map(|i| (p[i] + q[i] + r[i]) / 3.0);
+    let c = ctx.params.v2("plxGeometry/center");
+    let c = if c.iter().all(|v| v.is_finite()) { c } else { [ctx.layer_size[0] * 0.5, ctx.layer_size[1] * 0.5] };
+    let center = [c[0], c[1], fv(ctx, "plxGeometry/centerZ", 0.0)];
+    let out = [0, 1, 2].map(|i| mid[i] - center[i]);
+    if n[0] * out[0] + n[1] * out[1] + n[2] * out[2] < 0.0 {
+        n = n.map(|x| -x);
+    }
+    // The camera looks along +z from in front of the layer; its eye is far up the −z axis.
+    let eye = [ctx.layer_size[0] * 0.5, ctx.layer_size[1] * 0.5, -1e6 / b.scale.max(1e-9)];
+    let to_eye = [0, 1, 2].map(|i| eye[i] - mid[i]);
+    let facing = n[0] * to_eye[0] + n[1] * to_eye[1] + n[2] * to_eye[2] > 0.0;
+    if mode == 1 { !facing } else { facing }
+}
+
+/// Everything drawn at layer time `t`, far to near.
+fn primitives(ctx: &EffectCtx, b: &Buf, base: &[Vertex], t: f64) -> Vec<Prim> {
+    let mut pts = base.to_vec();
+    effectors(ctx, b, &mut pts, t);
+    let seen = project(ctx, b, &pts);
     let s = b.scale as f32;
     let pct = |id: &str, d: f64| (fv(ctx, id, d) / 100.0).clamp(0.0, 1.0) as f32;
 
@@ -712,19 +999,48 @@ fn plexus(ctx: &EffectCtx, b: Buf) -> Buf {
     let mut prims: Vec<(f64, Prim)> = Vec::new();
     if ctx.params.b("plxFacets/on") {
         let max = fv(ctx, "plxFacets/maxDistance", 110.0).max(0.0);
+        let min = fv(ctx, "plxFacets/minDistance", 0.0).max(0.0);
         let op = pct("plxFacets/opacity", 20.0);
         let fall = ctx.params.b("plxFacets/opacityFalloff");
         let own = (!ctx.params.b("plxFacets/useVertexColors")).then(|| finite_color(ctx.params.color("plxFacets/color")));
+        let far = ctx.params.b("plxFacets/colorBySize").then(|| finite_color(ctx.params.color("plxFacets/farColor")));
+        let cull = ctx.params.e("plxFacets/cull");
         // Few neighbours per point keep facets from piling up into a blown-out mass.
         let pairs = connections(&seen, 0.0, max, FACET_NEIGHBOURS);
         for (i, j, k, d) in triangles(seen.len(), &pairs) {
             let (Some(Some(a)), Some(Some(bv)), Some(Some(c))) = (seen.get(i), seen.get(j), seen.get(k)) else { continue };
-            let o = op * if fall { falloff(1, d / max.max(1e-9)) as f32 } else { 1.0 };
-            let col = [a, bv, c].map(|v| premul_rgb(own.unwrap_or(v.color), o * v.alpha));
+            // Facet Min Distance: every side at least this long.
+            let side = |p: &Seen, q: &Seen| ((p.world[0] - q.world[0]).powi(2) + (p.world[1] - q.world[1]).powi(2) + (p.world[2] - q.world[2]).powi(2)).sqrt();
+            if min > 0.0 && side(a, bv).min(side(bv, c)).min(side(a, c)) < min {
+                continue;
+            }
+            if culled(ctx, b, cull, [a, bv, c]) {
+                continue;
+            }
+            let tn = d / max.max(1e-9);
+            let o = op * if fall { falloff(1, tn) as f32 } else { 1.0 };
+            let col = [a, bv, c].map(|v| premul_rgb(towards(own.unwrap_or(v.color), far, tn), o * v.alpha));
             let p = [a, bv, c].map(|v| [v.xy[0] as f32, v.xy[1] as f32]);
             prims.push(((a.depth + bv.depth + c.depth) / 3.0, Prim::Tri { p, col }));
         }
     }
+    let by_depth = ctx.params.b("plxPoints/scaleByDepth");
+    // A line of width `w` between two points, widened by their depth of field blur.
+    let line = |a: &Seen, bv: &Seen, w: f32, ca: [f32; 3], cb: [f32; 3], o: f32| {
+        let wd = |v: &Seen| (if by_depth { w * v.scale as f32 } else { w }).max(0.0);
+        let (wa, wb) = (wd(a), wd(bv));
+        let (ga, gb) = (wa + a.blur * 2.0, wb + bv.blur * 2.0);
+        // Spreading a line over a wider band keeps its total light.
+        let k = |w: f32, g: f32| if g > 0.0 && w < g { (w.max(0.5) / g.max(0.5)).min(1.0) } else { 1.0 };
+        Prim::Line {
+            a: [a.xy[0] as f32, a.xy[1] as f32],
+            b: [bv.xy[0] as f32, bv.xy[1] as f32],
+            wa: ga,
+            wb: gb,
+            ca: premul_rgb(ca, o * a.alpha * k(wa, ga)),
+            cb: premul_rgb(cb, o * bv.alpha * k(wb, gb)),
+        }
+    };
     if ctx.params.b("plxLines/on") {
         let max = fv(ctx, "plxLines/maxDistance", 140.0).max(0.0);
         let min = fv(ctx, "plxLines/minDistance", 0.0).max(0.0);
@@ -733,7 +1049,7 @@ fn plexus(ctx: &EffectCtx, b: Buf) -> Buf {
         let op = pct("plxLines/opacity", 80.0);
         let (ofall, tfall) = (ctx.params.e("plxLines/opacityFalloff"), ctx.params.e("plxLines/thicknessFalloff"));
         let own = (!ctx.params.b("plxLines/useVertexColors")).then(|| finite_color(ctx.params.color("plxLines/color")));
-        let by_depth = ctx.params.b("plxPoints/scaleByDepth");
+        let far = ctx.params.b("plxLines/colorByLength").then(|| finite_color(ctx.params.color("plxLines/farColor")));
         for (i, j, d) in connections(&seen, min, max, k) {
             let (Some(Some(a)), Some(Some(bv))) = (seen.get(i), seen.get(j)) else { continue };
             let t = d / max.max(1e-9);
@@ -742,38 +1058,100 @@ fn plexus(ctx: &EffectCtx, b: Buf) -> Buf {
             if o <= 0.0 || th <= 0.0 {
                 continue;
             }
-            let wd = |v: &Seen| if by_depth { th * v.scale as f32 } else { th };
-            prims.push((
-                (a.depth + bv.depth) * 0.5,
-                Prim::Line {
-                    a: [a.xy[0] as f32, a.xy[1] as f32],
-                    b: [bv.xy[0] as f32, bv.xy[1] as f32],
-                    wa: wd(a),
-                    wb: wd(bv),
-                    ca: premul_rgb(own.unwrap_or(a.color), o * a.alpha),
-                    cb: premul_rgb(own.unwrap_or(bv.color), o * bv.alpha),
-                },
-            ));
+            let (ca, cb) = (towards(own.unwrap_or(a.color), far, t), towards(own.unwrap_or(bv.color), far, t));
+            prims.push(((a.depth + bv.depth) * 0.5, line(a, bv, th, ca, cb, o)));
+        }
+    }
+    if ctx.params.b("plxBeams/on") {
+        let tg = ctx.params.v2("plxBeams/target");
+        let tg = if tg.iter().all(|v| v.is_finite()) { tg } else { [ctx.layer_size[0] * 0.5, ctx.layer_size[1] * 0.5] };
+        let world = [tg[0], tg[1], fv(ctx, "plxBeams/targetZ", 0.0)];
+        let every = fv(ctx, "plxBeams/every", 10.0).round().clamp(1.0, MAX_POINTS as f64) as usize;
+        let thick = fv(ctx, "plxBeams/thickness", 1.0).max(0.0) as f32 * s;
+        let op = pct("plxBeams/opacity", 50.0);
+        let tc = finite_color(ctx.params.color("plxBeams/color"));
+        if let Some((xy, depth, scale)) = see_point(ctx, b, world)
+            && thick > 0.0
+            && op > 0.0
+        {
+            let vis = Visibility::new(ctx, b.scale);
+            let target = Seen { xy, depth, scale, world, color: tc, alpha: vis.fade(depth), size: 1.0, blur: vis.blur(depth) };
+            for v in seen.iter().step_by(every).flatten() {
+                prims.push(((v.depth + depth) * 0.5, line(v, &target, thick, v.color, tc, op)));
+            }
         }
     }
     if ctx.params.b("plxPoints/on") {
         let size = fv(ctx, "plxPoints/size", 4.0).max(0.0) as f32 * s;
         let op = pct("plxPoints/opacity", 100.0);
         let soft = pct("plxPoints/softness", 30.0);
-        let by_depth = ctx.params.b("plxPoints/scaleByDepth");
         if size > 0.0 && op > 0.0 {
             for v in seen.iter().flatten() {
-                let r = 0.5 * size * if by_depth { v.scale as f32 } else { 1.0 };
+                let r = 0.5 * size * v.size * if by_depth { v.scale as f32 } else { 1.0 };
+                if r.is_nan() || r <= 0.0 {
+                    continue;
+                }
+                // Depth of field: a bigger, softer disc with the same light.
+                let rb = r + v.blur;
+                let k = if rb > r { (r.max(0.5) / rb.max(0.5)).powi(2) } else { 1.0 };
+                let sb = if rb > r { soft.max((v.blur / rb).clamp(0.0, 1.0)) } else { soft };
                 // Points sit just in front of the lines that meet them.
-                prims.push((v.depth - 1e-6, Prim::Disc { c: [v.xy[0] as f32, v.xy[1] as f32], r, soft, col: premul_rgb(v.color, op * v.alpha) }));
+                prims.push((v.depth - 1e-6, Prim::Disc { c: [v.xy[0] as f32, v.xy[1] as f32], r: rb, soft: sb, col: premul_rgb(v.color, op * v.alpha * k) }));
             }
         }
     }
     prims.retain(|(d, p)| d.is_finite() && p.bbox().iter().all(|v| v.is_finite()) && (p.bbox()[2] - p.bbox()[0]) < 1e6);
     prims.sort_by(|a, b| b.0.total_cmp(&a.0));
-    let list: Vec<Prim> = prims.into_iter().map(|(_, p)| p).collect();
+    prims.into_iter().map(|(_, p)| p).collect()
+}
+
+/// Layer times to render at: the frame itself, or moments spread over the shutter.
+fn shutter_times(ctx: &EffectCtx) -> Vec<f64> {
+    let t = if ctx.time.is_finite() { ctx.time } else { 0.0 };
+    let fps = if ctx.env.frame_rate.is_finite() && ctx.env.frame_rate > 0.0 { ctx.env.frame_rate } else { 24.0 };
+    let (angle, phase, n) = match ctx.params.e("plxMotionBlur/mode") {
+        1 => match ctx.env.shutter {
+            Some((a, p, n)) => (a, p, n),
+            None => return vec![t],
+        },
+        2 => {
+            let a = fv(ctx, "plxMotionBlur/angle", 180.0).clamp(0.0, 720.0);
+            (a, -a * 0.5, fv(ctx, "plxMotionBlur/samples", 8.0).round().clamp(2.0, f64::from(MAX_BLUR_SAMPLES)) as u32)
+        }
+        _ => return vec![t],
+    };
+    let (angle, phase) = (if angle.is_finite() { angle.clamp(0.0, 720.0) } else { 0.0 }, if phase.is_finite() { phase.clamp(-720.0, 720.0) } else { 0.0 });
+    let n = n.clamp(2, MAX_BLUR_SAMPLES);
+    if angle <= 0.0 {
+        return vec![t];
+    }
+    (0..n).map(|i| t + (phase + angle * (f64::from(i) + 0.5) / f64::from(n)) / 360.0 / fps).collect()
+}
+
+fn plexus(ctx: &EffectCtx, b: Buf) -> Buf {
+    let (w, h) = (b.img.width as usize, b.img.height as usize);
+    if w == 0 || h == 0 || b.img.data.len() != w * h {
+        return b;
+    }
+    let pts = geometry(ctx, &b);
     let add = ctx.params.e("blendMode") == 1;
-    let drawn = rasterize(w, h, &list, add);
+    let times = shutter_times(ctx);
+    let drawn = if times.len() <= 1 {
+        rasterize(w, h, &primitives(ctx, &b, &pts, times.first().copied().unwrap_or(0.0)), add)
+    } else {
+        // Motion blur: the average of the moments.
+        let k = 1.0 / times.len() as f32;
+        let mut acc = Image::new(w as u32, h as u32);
+        for &t in &times {
+            let img = rasterize(w, h, &primitives(ctx, &b, &pts, t), add);
+            for (d, s) in acc.data.iter_mut().zip(&img.data) {
+                for c in 0..4 {
+                    d[c] += s[c] * k;
+                }
+            }
+        }
+        acc
+    };
 
     let mut img = b.img;
     if ctx.params.b("composite") {
@@ -844,8 +1222,9 @@ mod tests {
 
     #[test]
     fn connections_respect_distance_and_nearest_count() {
-        let pts: Vec<Option<Seen>> =
-            (0..10).map(|i| Some(Seen { xy: [0.0; 2], depth: 1.0, scale: 1.0, world: [i as f64 * 10.0, 0.0, 0.0], color: [1.0; 3], alpha: 1.0 })).collect();
+        let pts: Vec<Option<Seen>> = (0..10)
+            .map(|i| Some(Seen { xy: [0.0; 2], depth: 1.0, scale: 1.0, world: [i as f64 * 10.0, 0.0, 0.0], color: [1.0; 3], alpha: 1.0, size: 1.0, blur: 0.0 }))
+            .collect();
         // Neighbours 10 apart: within 15 only the chain links.
         let c = connections(&pts, 0.0, 15.0, 10);
         assert_eq!(c.len(), 9);
@@ -979,5 +1358,244 @@ mod tests {
             assert!(out.data.iter().all(|p| p.iter().all(|v| v.is_finite())));
         }
         assert!(run(&[], Image::new(0, 0)).data.is_empty());
+    }
+
+    fn pts_at(vals: &[(&str, Value)], t: f64) -> Vec<Vertex> {
+        let params = ctx_params(vals, [200.0, 200.0]);
+        let ctx = EffectCtx { params: &params, time: t, layer_size: [200.0, 200.0], seed: 1, adjustment: false, env: Default::default() };
+        let b = Buf { img: Image::new(200, 200), offset: [0.0, 0.0], scale: 1.0 };
+        let mut p = geometry(&ctx, &b);
+        effectors(&ctx, &b, &mut p, t);
+        p
+    }
+
+    #[test]
+    fn loop_noise_repeats_every_loop() {
+        let vals = [("plxNoise/loop", Value::Bool(true)), ("plxNoise/loopDuration", num(2.0)), ("plxNoise/speed", num(1.5)), ("plxTransform/spinY", num(0.0))];
+        let (a, b, mid) = (pts_at(&vals, 0.3), pts_at(&vals, 2.3), pts_at(&vals, 1.1));
+        for (p, q) in a.iter().zip(&b) {
+            assert!((0..3).all(|k| (p.pos[k] - q.pos[k]).abs() < 1e-6), "{:?} vs {:?}", p.pos, q.pos);
+        }
+        assert!(a.iter().zip(&mid).any(|(p, q)| (p.pos[0] - q.pos[0]).abs() > 1e-3), "but moves within the loop");
+        // Continuous across the seam.
+        let (end, start) = (pts_at(&vals, 1.9999), pts_at(&vals, 2.0));
+        assert!(end.iter().zip(&start).all(|(p, q)| (0..3).all(|k| (p.pos[k] - q.pos[k]).abs() < 0.05)));
+    }
+
+    #[test]
+    fn spherical_field_pushes_scales_and_tints_inside_its_radius() {
+        let base = [("plxNoise/amount", num(0.0)), ("plxTransform/spinY", num(0.0)), ("plxGeometry/count", num(400.0))];
+        let field = [
+            base[0].clone(),
+            base[1].clone(),
+            base[2].clone(),
+            ("plxField/on", Value::Bool(true)),
+            ("plxField/center", Value::Vec2([100.0, 100.0])),
+            ("plxField/radius", num(60.0)),
+            ("plxField/strength", num(30.0)),
+            ("plxField/scale", num(300.0)),
+            ("plxField/colorAmount", num(100.0)),
+        ];
+        let (a, b) = (pts_at(&base, 0.0), pts_at(&field, 0.0));
+        let dist = |p: [f64; 3]| ((p[0] - 100.0).powi(2) + (p[1] - 100.0).powi(2) + p[2].powi(2)).sqrt();
+        let mut inside = 0;
+        for (p, q) in a.iter().zip(&b) {
+            if dist(p.pos) < 60.0 {
+                inside += 1;
+                assert!(dist(q.pos) > dist(p.pos), "pushed out");
+                assert!(q.size > 1.0 && q.field_tint.is_some());
+            } else {
+                assert_eq!(p.pos, q.pos, "outside untouched");
+                assert_eq!(q.size, 1.0);
+            }
+        }
+        assert!(inside > 5);
+    }
+
+    #[test]
+    fn containers_hold_the_points() {
+        for (shape, inside) in [(1u32, true), (2, true)] {
+            let vals = [
+                ("plxNoise/amount", num(400.0)),
+                ("plxContainer/shape", Value::Enum(shape)),
+                ("plxContainer/scale", num(50.0)),
+                ("plxTransform/spinY", num(0.0)),
+            ];
+            // Box half size 50 × 50 × 100 around (100, 100, 0).
+            for v in pts_at(&vals, 0.7) {
+                let d = [(v.pos[0] - 100.0) / 50.0, (v.pos[1] - 100.0) / 50.0, v.pos[2] / 100.0];
+                let ok = if shape == 1 { d.iter().all(|x| x.abs() <= 1.0 + 1e-9) } else { d.iter().map(|x| x * x).sum::<f64>() <= 1.0 + 1e-6 };
+                assert_eq!(ok, inside, "shape {shape}: {d:?}");
+            }
+        }
+    }
+
+    struct MapHost(Image);
+    impl crate::EffectHost for MapHost {
+        fn layer(&self, _: u64, _: bool) -> Option<crate::LayerPixels> {
+            Some(crate::LayerPixels { buf: Buf { img: self.0.clone(), offset: [0.0; 2], scale: 1.0 }, size: [self.0.width as f64, self.0.height as f64] })
+        }
+        fn audio(&self, _: u64, _: f64, _: usize, _: u32) -> Option<Vec<f32>> {
+            None
+        }
+    }
+
+    #[test]
+    fn color_map_tints_sizes_and_lifts_points() {
+        // Left half red and dark, right half white.
+        let mut map = Image::new(200, 200);
+        for y in 0..200 {
+            for x in 0..200 {
+                map.set(x, y, if x < 100 { [0.3, 0.0, 0.0, 1.0] } else { [1.0; 4] });
+            }
+        }
+        let host = MapHost(map);
+        let params = ctx_params(
+            &[
+                ("plxNoise/amount", num(0.0)),
+                ("plxTransform/spinY", num(0.0)),
+                ("plxColorMap/layer", Value::Layer(Some(1))),
+                ("plxColorMap/scaleAmount", num(100.0)),
+                ("plxColorMap/displaceZ", num(50.0)),
+            ],
+            [200.0, 200.0],
+        );
+        let env = crate::EffectEnv { host: Some(&host), ..Default::default() };
+        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [200.0, 200.0], seed: 1, adjustment: false, env };
+        let b = Buf { img: Image::new(200, 200), offset: [0.0, 0.0], scale: 1.0 };
+        let before = geometry(&ctx, &b);
+        let mut after = before.clone();
+        effectors(&ctx, &b, &mut after, 0.0);
+        for (p, q) in before.iter().zip(&after) {
+            if p.pos[0] < 99.0 {
+                assert_eq!(q.map_tint.map(|t| t.0), Some([0.3, 0.0, 0.0]));
+                assert!(q.size < 1.0);
+            } else if p.pos[0] > 101.0 {
+                assert_eq!(q.map_tint.map(|t| t.0), Some([1.0; 3]));
+                assert!(q.size > 1.0 && (q.pos[2] - p.pos[2] - 50.0).abs() < 1e-9, "white lifts by the full 50");
+            }
+        }
+    }
+
+    #[test]
+    fn near_and_far_fades_and_depth_of_field() {
+        let params = ctx_params(
+            &[("plxCamera/nearStart", num(100.0)), ("plxCamera/nearEnd", num(200.0)), ("plxCamera/farStart", num(1000.0)), ("plxCamera/farEnd", num(2000.0))],
+            [10.0, 10.0],
+        );
+        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [10.0, 10.0], seed: 1, adjustment: false, env: Default::default() };
+        let v = Visibility::new(&ctx, 1.0);
+        assert_eq!(v.fade(50.0), 0.0);
+        assert!((v.fade(150.0) - 0.5).abs() < 1e-6);
+        assert_eq!(v.fade(500.0), 1.0);
+        assert!((v.fade(1500.0) - 0.5).abs() < 1e-6);
+        assert_eq!(v.fade(3000.0), 0.0);
+        assert_eq!(v.blur(1300.0), 0.0, "no DOF unless switched on");
+        let params = ctx_params(&[("plxCamera/dof", Value::Bool(true)), ("plxCamera/focus", num(1000.0)), ("plxCamera/aperture", num(10.0))], [10.0, 10.0]);
+        let ctx = EffectCtx { params: &params, time: 0.0, layer_size: [10.0, 10.0], seed: 1, adjustment: false, env: Default::default() };
+        let v = Visibility::new(&ctx, 1.0);
+        assert_eq!(v.blur(1000.0), 0.0);
+        assert!((v.blur(1500.0) - 5.0).abs() < 1e-5 && (v.blur(500.0) - 5.0).abs() < 1e-5);
+        // Rendered: an out-of-focus point covers more pixels with about the same light.
+        let one = |dof: bool| {
+            let v = only(&[
+                ("plxGeometry/source", Value::Enum(3)),
+                ("plxGeometry/columns", num(1.0)),
+                ("plxGeometry/rows", num(1.0)),
+                ("plxLines/on", Value::Bool(false)),
+                ("plxPoints/size", num(4.0)),
+                ("plxCamera/dof", Value::Bool(dof)),
+                ("plxCamera/focus", num(1000.0)),
+                ("plxCamera/aperture", num(10.0)),
+            ]);
+            run(&v, Image::new(60, 60))
+        };
+        let (sharp, soft) = (one(false), one(true));
+        let px = |o: &Image| o.data.iter().filter(|p| p[3] > 1e-4).count();
+        assert!(px(&soft) > px(&sharp) * 2, "{} vs {}", px(&soft), px(&sharp));
+        assert!((coverage(&soft) / coverage(&sharp) - 1.0).abs() < 0.6);
+    }
+
+    #[test]
+    fn facet_min_distance_cull_and_beams() {
+        let sphere = only(&[
+            ("plxGeometry/source", Value::Enum(2)),
+            ("plxGeometry/count", num(200.0)),
+            ("plxGeometry/depth", num(200.0)),
+            ("plxLines/on", Value::Bool(false)),
+            ("plxPoints/on", Value::Bool(false)),
+            ("plxFacets/on", Value::Bool(true)),
+            ("plxFacets/opacity", num(100.0)),
+        ]);
+        let img = Image::new(200, 200);
+        let all = coverage(&run(&sphere, img.clone()));
+        assert!(all > 0.0);
+        let mut v = sphere.clone();
+        v.push(("plxFacets/minDistance", num(1e6)));
+        assert_eq!(coverage(&run(&v, img.clone())), 0.0, "no facet has sides that long");
+        let cull = |m: u32| {
+            let mut v = sphere.clone();
+            v.push(("plxFacets/cull", Value::Enum(m)));
+            coverage(&run(&v, img.clone()))
+        };
+        let (away, toward) = (cull(1), cull(2));
+        assert!(away > 0.0 && toward > 0.0 && away < all && toward < all, "{away} {toward} {all}");
+        // Beams alone draw something; not without them.
+        let beams = only(&[
+            ("plxLines/on", Value::Bool(false)),
+            ("plxPoints/on", Value::Bool(false)),
+            ("plxBeams/on", Value::Bool(true)),
+            ("plxBeams/every", num(3.0)),
+        ]);
+        assert!(coverage(&run(&beams, Image::new(100, 100))) > 0.0);
+        assert_eq!(coverage(&run(&beams[..beams.len() - 2], Image::new(100, 100))), 0.0);
+    }
+
+    #[test]
+    fn motion_blur_smears_moving_points() {
+        let base = only(&[("plxTransform/spinZ", num(200.0)), ("plxLines/on", Value::Bool(false))]);
+        let mut blur = base.clone();
+        blur.push(("plxMotionBlur/mode", Value::Enum(2)));
+        let img = Image::new(100, 100);
+        let (a, b) = (run_at(&base, img.clone(), 0.5), run_at(&blur, img.clone(), 0.5));
+        assert_ne!(a.data, b.data);
+        assert_eq!(b.data, run_at(&blur, img.clone(), 0.5).data, "deterministic");
+        let px = |o: &Image| o.data.iter().filter(|p| p[3] > 1e-3).count();
+        assert!(px(&b) > px(&a), "the smear covers more pixels");
+        // Comp Shutter without a comp shutter: no blur.
+        let mut comp = base.clone();
+        comp.push(("plxMotionBlur/mode", Value::Enum(1)));
+        assert_eq!(run_at(&comp, img, 0.5).data, a.data);
+    }
+
+    #[test]
+    fn hostile_new_controls_do_not_panic() {
+        let img = Image::new(40, 30);
+        for vals in [
+            vec![("plxNoise/loop", Value::Bool(true)), ("plxNoise/loopDuration", num(0.0)), ("plxNoise/speed", num(1e300))],
+            vec![
+                ("plxField/on", Value::Bool(true)),
+                ("plxField/radius", num(1e300)),
+                ("plxField/strength", num(f64::NAN)),
+                ("plxField/center", Value::Vec2([f64::NAN, 0.0])),
+            ],
+            vec![("plxContainer/shape", Value::Enum(2)), ("plxContainer/scale", num(0.0)), ("plxGeometry/depth", num(0.0))],
+            vec![("plxContainer/shape", Value::Enum(9)), ("plxCamera/nearEnd", num(f64::INFINITY)), ("plxCamera/farEnd", num(-1.0))],
+            vec![("plxCamera/dof", Value::Bool(true)), ("plxCamera/focus", num(0.0)), ("plxCamera/aperture", num(1e300))],
+            vec![
+                ("plxFacets/on", Value::Bool(true)),
+                ("plxFacets/cull", Value::Enum(2)),
+                ("plxFacets/minDistance", num(f64::NAN)),
+                ("plxFacets/colorBySize", Value::Bool(true)),
+            ],
+            vec![("plxBeams/on", Value::Bool(true)), ("plxBeams/every", num(0.0)), ("plxBeams/targetZ", num(-1e300)), ("plxBeams/thickness", num(1e300))],
+            vec![("plxMotionBlur/mode", Value::Enum(2)), ("plxMotionBlur/samples", num(1e9)), ("plxMotionBlur/angle", num(f64::NAN))],
+        ] {
+            for t in [0.0, f64::NAN, 1e300] {
+                let out = run_at(&vals, img.clone(), t);
+                assert_eq!((out.width, out.height), (40, 30));
+                assert!(out.data.iter().all(|p| p.iter().all(|v| v.is_finite())), "{vals:?}");
+            }
+        }
     }
 }

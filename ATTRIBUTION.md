@@ -83,9 +83,9 @@ Screenshots of EffectCraft itself, rendered headlessly, showing only procedurall
 - Built-in project templates (Lower Third, Title Card, Logo Reveal, Kinetic Type, Social Square, Vertical Story,
   Slideshow, 3D Text Orbit) built from engine commands, and their thumbnails rendered by our own renderer:
   `crates/engine/src/templates.rs`.
-- Text animator presets (35 in Animate In, Animate Out and Loops: Typewriter, Fade Up Characters, Bounce In Words,
+- Text animator presets (39 in Animate In, Animate Out and Loops: Typewriter, Fade Up Characters, Bounce In Words,
   Tracking In, Scramble, Blur In, Jitter, Drop In Lines, and cascades, flips, spins, pops, backspace, waves, colour
-  waves, highlight sweeps, neon flicker…): `crates/engine/presets/text_animators.json` (sidecar `.attribution`).
+  waves, highlight sweeps, neon flicker, data-damage glitches…): `crates/engine/presets/text_animators.json` (sidecar `.attribution`).
 - Transition animation presets (23: wipes, clock and fan reveals, blinds, dissolves, card flips, CC wipes, fades):
   `crates/engine/presets/transitions.json` (sidecar `.attribution`).
 - Backgrounds animation presets (23: drifting gradients, fog, cloud and smoke, plasma and magma, cells and crystals, scrolling grids

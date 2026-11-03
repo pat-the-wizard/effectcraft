@@ -3,11 +3,11 @@
 <!-- Generated from the effect registry (crates/effects/src/catalog.rs); do not edit by hand.
      Regenerate: UPDATE_DOCS=1 cargo test -p effectcraft-effects --lib effects_doc_is_current -->
 
-EffectCraft ships 311 effects with 3079 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
+EffectCraft ships 312 effects with 3148 parameters in total, grouped into the same categories as the Effects & Presets panel. Every effect is our own implementation, written from public behaviour descriptions and standard image-processing literature. Parameter names, order, popup options, units, defaults and ranges follow the reference application so that projects, expressions and muscle memory carry over.
 
 - **GPU**: 280 effects also run on the GPU compositor with identical results.
-- **32**: 311 effects process 32-bit float (HDR, overbright) pixels without clamping.
-- **Status**: 311 implemented in full, 0 partial (what is missing is listed).
+- **32**: 312 effects process 32-bit float (HDR, overbright) pixels without clamping.
+- **Status**: 312 implemented in full, 0 partial (what is missing is listed).
 
 Effects are addressed by id (`ec.<category>.<name>`) or display name in commands, scripts and the control channel, and every parameter by its id (`effects/#1/blurriness`).
 
@@ -210,7 +210,7 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | Grid | `ec.generate.grid` | 12 | GPU | 32 | Implemented |
 | Lens Flare | `ec.generate.lensflare` | 4 | GPU | 32 | Implemented |
 | Paint Bucket | `ec.generate.paintbucket` | 11 | GPU | 32 | Implemented |
-| Plexus | `ec.generate.plexus` | 54 |  | 32 | Implemented |
+| Plexus | `ec.generate.plexus` | 94 |  | 32 | Implemented |
 | Radio Waves | `ec.generate.radiowaves` | 31 | GPU | 32 | Implemented |
 | Scribble | `ec.generate.scribble` | 25 | GPU | 32 | Implemented |
 | Stroke | `ec.generate.stroke` | 11 | GPU | 32 | Implemented |
@@ -357,14 +357,15 @@ Effects are addressed by id (`ec.<category>.<name>`) or display name in commands
 | CC Vignette | `ec.stylize.ccvignette` | 4 | GPU | 32 | Implemented |
 | Cartoon | `ec.stylize.cartoon` | 12 | GPU | 32 | Implemented |
 | Color Emboss | `ec.stylize.coloremboss` | 4 | GPU | 32 | Implemented |
+| Data Damage | `ec.stylize.datadamage` | 15 |  | 32 | Implemented |
 | Emboss | `ec.stylize.emboss` | 4 | GPU | 32 | Implemented |
 | Find Edges | `ec.stylize.findedges` | 2 | GPU | 32 | Implemented |
 | Glow | `ec.stylize.glow` | 14 | GPU | 32 | Implemented |
 | Mosaic | `ec.stylize.mosaic` | 3 | GPU | 32 | Implemented |
 | Motion Tile | `ec.stylize.motiontile` | 8 | GPU | 32 | Implemented |
-| Pixel Sort | `ec.stylize.pixelsort` | 17 |  | 32 | Implemented |
+| Pixel Sort | `ec.stylize.pixelsort` | 30 |  | 32 | Implemented |
 | Posterize | `ec.stylize.posterize` | 1 | GPU | 32 | Implemented |
-| Retro Dither | `ec.stylize.retrodither` | 21 |  | 32 | Implemented |
+| Retro Dither | `ec.stylize.retrodither` | 22 |  | 32 | Implemented |
 | Roughen Edges | `ec.stylize.roughenedges` | 13 | GPU | 32 | Implemented |
 | Scatter | `ec.stylize.scatter` | 3 | GPU | 32 | Implemented |
 | Strobe Light | `ec.stylize.strobe` | 7 | GPU | 32 | Implemented |

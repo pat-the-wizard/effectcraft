@@ -66,6 +66,8 @@ fn retro_plexus_looks() {
         ("dither_bayer_gameboy_px4", &[("method", json!(3)), ("palette", json!(3)), ("pixelSize", json!(4))]),
         ("dither_atkinson_bw", &[("method", json!(10)), ("palette", json!(0))]),
         ("dither_c64_px3", &[("palette", json!(7)), ("pixelSize", json!(3)), ("method", json!(12))]),
+        ("dither_graymap_gameboy_px2", &[("grayMap", json!(true)), ("palette", json!(3)), ("pixelSize", json!(2)), ("method", json!(10))]),
+        ("dither_graymap_c64_bayer", &[("grayMap", json!(true)), ("palette", json!(7)), ("method", json!(3)), ("pixelSize", json!(3))]),
     ];
     for (name, vals) in dither {
         let (mut s, l) = session(480, 270);
@@ -102,6 +104,56 @@ fn retro_plexus_looks() {
                 ("plxTransform/rotationX", json!(35)),
             ],
         ),
+        (
+            "plexus_field_container",
+            &[
+                ("plxGeometry/count", json!(500)),
+                ("plxNoise/amount", json!(160)),
+                ("plxContainer/shape", json!(2)),
+                ("plxContainer/scale", json!(70)),
+                ("plxField/on", json!(true)),
+                ("plxField/center", json!([240, 135])),
+                ("plxField/radius", json!(110)),
+                ("plxField/strength", json!(-45)),
+                ("plxField/scale", json!(260)),
+                ("plxField/colorAmount", json!(100)),
+                ("plxLines/maxDistance", json!(55)),
+            ],
+        ),
+        (
+            "plexus_beams_dof",
+            &[
+                ("plxGeometry/source", json!(1)),
+                ("plxGeometry/count", json!(220)),
+                ("plxGeometry/depth", json!(900)),
+                ("plxCamera/dof", json!(true)),
+                ("plxCamera/focus", json!(650)),
+                ("plxCamera/aperture", json!(9)),
+                ("plxBeams/on", json!(true)),
+                ("plxBeams/every", json!(6)),
+                ("plxBeams/target", json!([240, 135])),
+                ("plxBeams/opacity", json!(35)),
+                ("plxLines/colorByLength", json!(true)),
+            ],
+        ),
+        (
+            "plexus_facets_cull_blur",
+            &[
+                ("plxGeometry/source", json!(2)),
+                ("plxGeometry/count", json!(300)),
+                ("plxGeometry/width", json!(55)),
+                ("plxGeometry/height", json!(95)),
+                ("plxGeometry/depth", json!(260)),
+                ("plxFacets/on", json!(true)),
+                ("plxFacets/opacity", json!(45)),
+                ("plxFacets/cull", json!(1)),
+                ("plxFacets/colorBySize", json!(true)),
+                ("plxLines/maxDistance", json!(55)),
+                ("plxTransform/spinY", json!(90)),
+                ("plxMotionBlur/mode", json!(2)),
+                ("plxMotionBlur/angle", json!(270)),
+            ],
+        ),
     ];
     for (name, vals) in plexus {
         let (mut s, l) = session(480, 270);
@@ -110,5 +162,30 @@ fn retro_plexus_looks() {
             s.execute("prop.set", json!({"layer": l, "path": format!("effects/#1/{k}"), "value": v})).unwrap();
         }
         save(name, &render(&s, 1.0));
+    }
+    // Data Damage on a text layer: held damage, mid Glitch On, and the text preset.
+    let damage: &[(&str, f64, &[(&str, serde_json::Value)])] = &[
+        ("damage_hold", 0.4, &[("damage", json!(80))]),
+        ("damage_glitch_on_mid", 0.55, &[("envelope", json!(1)), ("damage", json!(100))]),
+        ("damage_heavy_split", 0.9, &[("damage", json!(100)), ("rgbSplit", json!(14)), ("pixelate", json!(60)), ("blockSize", json!(36))]),
+    ];
+    for (name, t, vals) in damage {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "C", "width": 480, "height": 270, "duration": 4})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "BG", "color": "#0c1018"})).unwrap();
+        let l = s.execute("layer.newText", json!({"text": "DATA DAMAGE", "size": 64})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("effect.apply", json!({"layers": [l], "effect": "Data Damage"})).unwrap();
+        for (k, v) in vals.iter() {
+            s.execute("prop.set", json!({"layer": l, "path": format!("effects/#1/{k}"), "value": v})).unwrap();
+        }
+        save(name, &render(&s, *t));
+    }
+    for (name, preset, t) in [("text_data_damage_on_mid", "dataDamageOn", 0.45), ("text_data_damage_off_mid", "dataDamageOff", 0.4)] {
+        let mut s = Session::default();
+        s.execute("comp.new", json!({"name": "C", "width": 480, "height": 270, "duration": 4})).unwrap();
+        s.execute("layer.newSolid", json!({"name": "BG", "color": "#0c1018"})).unwrap();
+        let l = s.execute("layer.newText", json!({"text": "DATA DAMAGE", "size": 64})).unwrap()["layer"].as_u64().unwrap();
+        s.execute("layer.applyTextPreset", json!({"layer": l, "preset": preset})).unwrap();
+        save(name, &render(&s, t));
     }
 }

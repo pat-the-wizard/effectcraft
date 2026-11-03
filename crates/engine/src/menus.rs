@@ -1043,6 +1043,8 @@ Animation
       Flip Up Characters | layer.applyTextPreset {"preset":"flipUpCharacters"}
       Skew In | layer.applyTextPreset {"preset":"skewIn"}
       Fall In Characters | layer.applyTextPreset {"preset":"fallInCharacters"}
+      Data Damage On | layer.applyTextPreset {"preset":"dataDamageOn"}
+      Data Damage On (Short) | layer.applyTextPreset {"preset":"dataDamageOnShort"}
     Animate Out
       Fade Out Characters | layer.applyTextPreset {"preset":"fadeOutCharacters"}
       Fall Away Characters | layer.applyTextPreset {"preset":"fallAwayCharacters"}
@@ -1054,6 +1056,7 @@ Animation
       Spin Out Characters | layer.applyTextPreset {"preset":"spinOutCharacters"}
       Drop Out Lines | layer.applyTextPreset {"preset":"dropOutLines"}
       Slide Out to Left | layer.applyTextPreset {"preset":"slideOutToLeft"}
+      Data Damage Off | layer.applyTextPreset {"preset":"dataDamageOff"}
     Loops
       Jitter | layer.applyTextPreset {"preset":"jitter"}
       Wave | layer.applyTextPreset {"preset":"wave"}
@@ -1063,6 +1066,7 @@ Animation
       Highlight Sweep | layer.applyTextPreset {"preset":"highlightSweep"}
       Neon Flicker | layer.applyTextPreset {"preset":"neonFlicker"}
       Breathing Text | layer.applyTextPreset {"preset":"breathingText"}
+      Data Glitch | layer.applyTextPreset {"preset":"dataGlitch"}
   ---
   Add Keyframe | anim.addKeyframe
   Toggle Hold Keyframe | keys.toggleHold

@@ -18,6 +18,10 @@
 //! * **Palettes** are lists of colours (the hardware palettes are published facts about that
 //!   hardware's output, approximated as sRGB) or per-channel levels (RGB 3-3-2, web safe, Levels),
 //!   or come from a layer (median cut) or the eight Custom colours.
+//! * **Map Gray onto Palette** dithers the picture's grey levels and then lays them onto the
+//!   palette ordered dark to light, so any palette turns a monochrome image into a colour ramp.
+//! * A Palette Layer with no more distinct colours than Number of Colors (a strip of swatches,
+//!   a small colour scheme) gives exactly those colours; a busier one is reduced by median cut.
 //! * Matching happens on display-encoded (sRGB) values, so a linear working space dithers like a
 //!   display-referred one; alpha is kept.
 
@@ -89,6 +93,7 @@ pub fn specs() -> Vec<EffectSpec> {
         p("threshold", "Threshold", num(0.0), slider(-100.0, 100.0, -100.0, 100.0, 1)),
         p("serpentine", "Serpentine Scan", Value::Bool(true), ParamUi::Checkbox),
         p("grayscale", "Grayscale First", Value::Bool(false), ParamUi::Checkbox),
+        p("grayMap", "Map Gray onto Palette", Value::Bool(false), ParamUi::Checkbox),
         p("perceptual", "Perceptual Matching", Value::Bool(true), ParamUi::Checkbox),
         p("levels", "Levels per Channel", num(4.0), slider(2.0, 64.0, 2.0, 16.0, 0)),
         p("rdCustom/count", "Number of Colors", num(4.0), slider(2.0, 8.0, 2.0, 8.0, 0)),
@@ -109,7 +114,7 @@ pub fn specs() -> Vec<EffectSpec> {
     }
     params.extend([
         p("rdLayer/layer", "Palette Layer", Value::Layer(None), ParamUi::Layer),
-        p("rdLayer/colors", "Number of Colors", num(8.0), slider(2.0, 64.0, 2.0, 32.0, 0)),
+        p("rdLayer/colors", "Number of Colors", num(8.0), slider(2.0, MAX_LAYER_COLORS as f64, 2.0, 32.0, 0)),
         p("blend", "Blend With Original", num(0.0), slider(0.0, 100.0, 0.0, 100.0, 1)),
     ]);
     vec![EffectSpec { id: ID, name: "Retro Dither", category: "Stylize", params, render: retro_dither, gpu: false, float: true }]
@@ -252,6 +257,24 @@ fn median_cut(samples: Vec<[f32; 3]>, n: usize) -> Vec<[f32; 3]> {
 
 /// Most samples a From Layer palette reads (evenly strided).
 const MAX_SAMPLES: usize = 65_536;
+/// Most colours a From Layer palette holds.
+const MAX_LAYER_COLORS: usize = 256;
+
+/// The distinct colours of `samples` (to 8 bits per channel), dark to light, when there are no
+/// more than `n` of them.
+fn exact_colors(samples: &[[f32; 3]], n: usize) -> Option<Vec<[f32; 3]>> {
+    let mut seen = std::collections::BTreeMap::new();
+    for c in samples {
+        let k = c.map(|v| (v.clamp(0.0, 1.0) * 255.0).round() as u8);
+        seen.entry(k).or_insert(*c);
+        if seen.len() > n {
+            return None;
+        }
+    }
+    let mut out: Vec<[f32; 3]> = seen.into_keys().map(|k| k.map(|v| f32::from(v) / 255.0)).collect();
+    out.sort_by(|a, b| luminance(a[0], a[1], a[2]).total_cmp(&luminance(b[0], b[1], b[2])));
+    (out.len() >= 2).then_some(out)
+}
 
 fn palette(ctx: &EffectCtx, b: &Buf, enc: &dyn Fn(f32) -> f32) -> Palette {
     let list = |hex: &[u32]| Palette::List(hex.iter().map(|&h| rgb(h)).collect());
@@ -289,7 +312,7 @@ fn palette(ctx: &EffectCtx, b: &Buf, enc: &dyn Fn(f32) -> f32) -> Palette {
         }
         FROM_LAYER => {
             let n = ctx.params.f("rdLayer/colors");
-            let n = if n.is_finite() { n.round().clamp(2.0, 64.0) as usize } else { 8 };
+            let n = if n.is_finite() { n.round().clamp(2.0, MAX_LAYER_COLORS as f64) as usize } else { 8 };
             // The chosen layer, else the layer itself.
             let other = ctx.layer_param("rdLayer/layer", false);
             let img = other.as_ref().map_or(&b.img, |o| &o.buf.img);
@@ -304,7 +327,7 @@ fn palette(ctx: &EffectCtx, b: &Buf, enc: &dyn Fn(f32) -> f32) -> Palette {
                     c.map(|v| if v.is_finite() { enc(v).clamp(0.0, 1.0) } else { 0.0 })
                 })
                 .collect();
-            Palette::List(median_cut(samples, n))
+            Palette::List(exact_colors(&samples, n).unwrap_or_else(|| median_cut(samples, n)))
         }
         _ => list(&CGA_16),
     }
@@ -481,10 +504,26 @@ fn retro_dither(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let enc = move |v: f32| if linear { linear_to_srgb(v) } else { v };
     let dec = move |v: f32| if linear { srgb_to_linear(v) } else { v };
     let pal = palette(ctx, &b, &enc);
+    // Map Gray onto Palette: dither grey levels, then look each level up on the palette ramp.
+    let ramp: Option<Vec<[f32; 3]>> = ctx.params.b("grayMap").then(|| match &pal {
+        Palette::List(c) => {
+            let mut r = c.clone();
+            r.sort_by(|a, b| luminance(a[0], a[1], a[2]).total_cmp(&luminance(b[0], b[1], b[2])));
+            r
+        }
+        Palette::Levels(l) => {
+            let n = l[1].max(2);
+            (0..n).map(|i| [i as f32 / (n - 1) as f32; 3]).collect()
+        }
+    });
+    let pal = match &ramp {
+        Some(r) => Palette::grays(r.len().clamp(2, 1 << 16) as u32),
+        None => pal,
+    };
     let method = ctx.params.e("method").min(15);
     let amount = (f("amount", 100.0) / 100.0).clamp(0.0, 2.0) as f32;
     let bias = (f("threshold", 0.0) / 200.0).clamp(-0.5, 0.5) as f32;
-    let gray = ctx.params.b("grayscale");
+    let gray = ctx.params.b("grayscale") || ramp.is_some();
     let wts = if ctx.params.b("perceptual") { [0.299, 0.587, 0.114] } else { [1.0; 3] };
 
     // The cell grid, aligned to the layer origin.
@@ -569,6 +608,15 @@ fn retro_dither(ctx: &EffectCtx, mut b: Buf) -> Buf {
                         }
                     }
                 }
+            }
+        }
+    }
+    if let Some(r) = ramp.as_ref().filter(|r| r.len() >= 2) {
+        let last = (r.len() - 1) as f32;
+        for (c, _) in cells.iter_mut() {
+            let i = (c[0].clamp(0.0, 1.0) * last).round() as usize;
+            if let Some(&q) = r.get(i) {
+                *c = q;
             }
         }
     }
@@ -767,5 +815,57 @@ mod tests {
             assert!(out.data.iter().all(|p| p.iter().all(|v| v.is_finite())));
         }
         assert!(run(&[], Image::new(0, 0)).data.is_empty());
+    }
+
+    #[test]
+    fn gray_map_lays_grey_levels_onto_the_palette_ramp() {
+        // A grey ramp through the Game Boy greens: left end darkest green, right end lightest,
+        // and only the palette's four colours.
+        let mut grey = Image::new(64, 4);
+        for y in 0..4 {
+            for x in 0..64 {
+                let v = x as f32 / 63.0;
+                grey.set(x, y, [v, v, v, 1.0]);
+            }
+        }
+        let set = |hex: &[u32]| -> std::collections::BTreeSet<[u32; 3]> { hex.iter().map(|&h| [(h >> 16) & 255, (h >> 8) & 255, h & 255]).collect() };
+        let out = run(&[("palette", Value::Enum(3)), ("grayMap", Value::Bool(true)), ("method", Value::Enum(0))], grey.clone());
+        assert_eq!(colors(&out), set(&GAME_BOY), "exactly the four greens");
+        let px = |o: &Image, x: i64| [o.get(x, 0)[0], o.get(x, 0)[1], o.get(x, 0)[2]];
+        assert_eq!(px(&out, 0), rgb(GAME_BOY[0]));
+        assert_eq!(px(&out, 63), rgb(GAME_BOY[3]));
+        // Dithered too, with every method, still only palette colours.
+        for m in 1..16u32 {
+            let o = run(&[("palette", Value::Enum(7)), ("grayMap", Value::Bool(true)), ("method", Value::Enum(m))], grey.clone());
+            assert!(colors(&o).is_subset(&set(&C64)), "method {m}");
+        }
+    }
+
+    #[test]
+    fn a_small_palette_source_gives_exactly_its_colours() {
+        let sw = [[0.9f32, 0.1, 0.1], [0.1, 0.8, 0.2], [0.2, 0.3, 0.95], [0.95, 0.9, 0.2], [0.05, 0.05, 0.05]];
+        let swatches = sw.iter().map(|c| c.map(|v| (v * 255.0).round() / 255.0)).collect::<Vec<_>>();
+        let samples: Vec<[f32; 3]> = (0..500).map(|i| swatches[i % 5]).collect();
+        let exact = exact_colors(&samples, 8).unwrap();
+        assert_eq!(exact.len(), 5);
+        for c in &swatches {
+            assert!(exact.iter().any(|e| (0..3).all(|k| (e[k] - c[k]).abs() < 1e-6)), "{c:?} kept");
+        }
+        assert!(exact_colors(&samples, 4).is_none(), "more colours than wanted: median cut instead");
+        assert!(exact_colors(&[[0.5; 3]; 9], 4).is_none(), "one colour is no palette");
+    }
+
+    #[test]
+    fn hostile_gray_map_and_layer_colours() {
+        let mut img = ramp(9, 5);
+        img.set(2, 2, [f32::NAN, f32::INFINITY, -3.0, 1.0]);
+        for vals in [
+            vec![("grayMap", Value::Bool(true)), ("palette", Value::Enum(13)), ("levels", num(f64::NAN))],
+            vec![("grayMap", Value::Bool(true)), ("palette", Value::Enum(15)), ("rdLayer/colors", num(1e300))],
+            vec![("grayMap", Value::Bool(true)), ("palette", Value::Enum(14)), ("rdCustom/count", num(-4.0)), ("method", Value::Enum(8))],
+        ] {
+            let out = run(&vals, img.clone());
+            assert_eq!((out.width, out.height), (9, 5));
+        }
     }
 }

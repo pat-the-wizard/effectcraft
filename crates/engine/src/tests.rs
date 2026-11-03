@@ -6,6 +6,7 @@ mod camera_track;
 mod codec_options;
 mod color_view;
 mod crypto_pick;
+mod data_damage;
 mod delete_keys;
 mod disk_cache;
 mod effects;

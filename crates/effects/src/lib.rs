@@ -23,6 +23,7 @@ mod color3;
 mod color_fx;
 pub mod controls;
 pub mod crypto_select;
+mod data_damage;
 mod distort;
 mod distort2;
 mod distort3;
@@ -658,6 +659,7 @@ pub fn registry() -> &'static [EffectSpec] {
         v.extend(textfx::specs());
         v.extend(stylize3::specs());
         v.extend(pixel_sort::specs());
+        v.extend(data_damage::specs());
         v.extend(retro_dither::specs());
         v.extend(plexus::specs());
         v.extend(transition2::specs());
@@ -997,6 +999,7 @@ fn group_name(m: &str) -> &str {
         .chain(roto::GROUPS)
         .chain(object_matte::GROUPS)
         .chain(keylight::GROUPS)
+        .chain(pixel_sort::GROUPS)
         .chain(retro_dither::GROUPS)
         .chain(plexus::GROUPS)
         .chain(PARAM_GROUPS)
@@ -1329,6 +1332,10 @@ pub const READS_COMP_SCENE: &[&str] =
 pub const TIME_DEPENDENT: &[&str] = &[
     // Plexus: the Noise effector evolves and the Transform effector spins over time.
     plexus::ID,
+    // Pixel Sort's floating particles travel over time.
+    pixel_sort::ID,
+    // Data Damage's pattern changes several times a second, and its envelope runs on time.
+    data_damage::ID,
     "ec.distort.wavewarp",
     "ec.distort.ripple",
     "ec.generate.radiowaves",

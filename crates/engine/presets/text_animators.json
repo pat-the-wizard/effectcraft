@@ -712,6 +712,169 @@
           "selectors": []
         }
       ]
+    },
+    {
+      "id": "dataDamageOn",
+      "name": "Data Damage On",
+      "category": "Animate In",
+      "description": "Characters flicker into view in a random order as scrambled, jumping glyphs that settle into the text (about 30 frames).",
+      "animators": [
+        {
+          "name": "Glitch Reveal",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0, 0], [0.7, 100]] }
+            }
+          ]
+        },
+        {
+          "name": "Data Scramble",
+          "properties": { "characterOffset": 24, "position": [16, 0, 0] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0.3, 0], [1, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 14, "correlation": 0, "minAmount": -100, "maxAmount": 100 }
+            }
+          ]
+        },
+        {
+          "name": "Signal Flicker",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0.3, 0], [1, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 11, "correlation": 0, "minAmount": 0, "maxAmount": 100 }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dataDamageOnShort",
+      "name": "Data Damage On (Short)",
+      "category": "Animate In",
+      "description": "The short version of Data Damage On (about 18 frames).",
+      "animators": [
+        {
+          "name": "Glitch Reveal",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0, 0], [0.42, 100]] }
+            }
+          ]
+        },
+        {
+          "name": "Data Scramble",
+          "properties": { "characterOffset": 24, "position": [16, 0, 0] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0.18, 0], [0.6, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 14, "correlation": 0, "minAmount": -100, "maxAmount": 100 }
+            }
+          ]
+        },
+        {
+          "name": "Signal Flicker",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "start": [[0.18, 0], [0.6, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 11, "correlation": 0, "minAmount": 0, "maxAmount": 100 }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dataDamageOff",
+      "name": "Data Damage Off",
+      "category": "Animate Out",
+      "description": "Characters break up into scrambled, flickering glyphs and drop out in a random order.",
+      "animators": [
+        {
+          "name": "Data Scramble",
+          "properties": { "characterOffset": 24, "position": [16, 0, 0] },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "end": [[0, 0], [0.7, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 14, "correlation": 0, "minAmount": -100, "maxAmount": 100 }
+            }
+          ]
+        },
+        {
+          "name": "Signal Flicker",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "end": [[0, 0], [0.7, 100]] }
+            },
+            {
+              "kind": "wiggly",
+              "set": { "wigglesPerSecond": 11, "correlation": 0, "minAmount": 0, "maxAmount": 100 }
+            }
+          ]
+        },
+        {
+          "name": "Glitch Erase",
+          "properties": { "opacity": 0 },
+          "selectors": [
+            {
+              "kind": "range",
+              "set": { "advanced/randomize": true, "advanced/smoothness": 0 },
+              "keys": { "end": [[0.3, 0], [1, 100]] }
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "id": "dataGlitch",
+      "name": "Data Glitch",
+      "category": "Loops",
+      "description": "Now and then a few characters break up into random glyphs and jump sideways, continuously.",
+      "animators": [
+        {
+          "name": "Data Glitch",
+          "properties": { "characterOffset": 18, "position": [22, 0, 0], "opacity": 40 },
+          "selectors": [
+            { "kind": "range" },
+            { "kind": "expression", "expr": { "amount": "var k = Math.floor(time * 12); var h = Math.sin(k * 12.9898 + textIndex * 78.233) * 43758.5453; h = h - Math.floor(h); var a = h > 0.9 ? 100 : 0; [a, a, a]" } }
+          ]
+        }
+      ]
     }
   ]
 }

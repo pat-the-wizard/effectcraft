@@ -106,6 +106,19 @@ fn pixel_sort_looks() {
         ("diagonal_shadows", &[("direction", json!(135)), ("invertSpans", json!(true)), ("lowerThreshold", json!(45))]),
         ("hue_gradient_feather", &[("sortBy", json!(1)), ("fill", json!(1)), ("feather", json!(12)), ("maxLength", json!(60))]),
         ("random_reverse", &[("sortBy", json!(8)), ("lowerThreshold", json!(55)), ("direction", json!(0))]),
+        ("stretch_smear", &[("fill", json!(2)), ("lowerThreshold", json!(55)), ("maxLength", json!(140)), ("randomLength", json!(60))]),
+        ("mirror_noise", &[("mirror", json!(true)), ("psNoise/amount", json!(35)), ("psNoise/scale", json!(18)), ("maxLength", json!(90))]),
+        ("noise_spans_down", &[("direction", json!(180)), ("psNoise/amount", json!(45)), ("psNoise/target", json!(1)), ("psNoise/scale", json!(25))]),
+        (
+            "floating_particles",
+            &[
+                ("lowerThreshold", json!(60)),
+                ("maxLength", json!(70)),
+                ("psParticles/amount", json!(35)),
+                ("psParticles/length", json!(28)),
+                ("psParticles/distance", json!(220)),
+            ],
+        ),
     ];
     for (name, vals) in variants {
         let mut s = Session::default();

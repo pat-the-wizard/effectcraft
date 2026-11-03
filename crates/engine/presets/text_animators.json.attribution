@@ -1,7 +1,7 @@
 asset:        text_animators.json
-title:        EffectCraft text animator presets (35, in Animate In, Animate Out and Loops)
+title:        EffectCraft text animator presets (39, in Animate In, Animate Out and Loops)
 author:       EffectCraft contributors
 source:       original work
 license:      MIT OR Apache-2.0
-added:        2026-10-02 by EffectCraft agent (M9.6); 27 more and the Animate In / Animate Out / Loops categories 2026-11-02 by EffectCraft agent (gap 7)
+added:        2026-10-02 by EffectCraft agent (M9.6); 27 more and the Animate In / Animate Out / Loops categories 2026-11-02 by EffectCraft agent (gap 7); 4 data-damage glitch presets 2026-11-03 by EffectCraft agent (G8)
 notes:        Animator/selector settings written from scratch for EffectCraft; not derived from any Adobe preset (.ffx).
