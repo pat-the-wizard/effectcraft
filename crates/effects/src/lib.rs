@@ -50,9 +50,11 @@ pub mod paint;
 mod perspective;
 mod perspective2;
 mod pixel_sort;
+mod plexus;
 pub mod plugin;
 pub mod psim;
 pub mod puppet;
+mod retro_dither;
 pub mod roto;
 mod sim;
 mod sim2;
@@ -656,6 +658,8 @@ pub fn registry() -> &'static [EffectSpec] {
         v.extend(textfx::specs());
         v.extend(stylize3::specs());
         v.extend(pixel_sort::specs());
+        v.extend(retro_dither::specs());
+        v.extend(plexus::specs());
         v.extend(transition2::specs());
         v.extend(channel2::specs());
         v.extend(keying2::specs());
@@ -993,6 +997,8 @@ fn group_name(m: &str) -> &str {
         .chain(roto::GROUPS)
         .chain(object_matte::GROUPS)
         .chain(keylight::GROUPS)
+        .chain(retro_dither::GROUPS)
+        .chain(plexus::GROUPS)
         .chain(PARAM_GROUPS)
         .find(|(id, _)| *id == m)
         .map(|(_, n)| *n)
@@ -1314,12 +1320,15 @@ pub const GPU_EFFECTS: &[&str] = &[
 /// Effects that can read [`EffectHost::comp_scene`] (the comp camera or the first comp light):
 /// their output changes when the camera, the lights or the layer's own transform move, so the
 /// renderer's layer cache folds the comp scene into the key for these.
-pub const READS_COMP_SCENE: &[&str] = &["ec.sim.carddance", "ec.sim.shatter", "ec.transition.cardwipe", "ec.sim.caustics", "ec.sim.ccparticleworld"];
+pub const READS_COMP_SCENE: &[&str] =
+    &["ec.sim.carddance", "ec.sim.shatter", "ec.transition.cardwipe", "ec.sim.caustics", "ec.sim.ccparticleworld", plexus::ID];
 
 /// Effects whose output depends on [`EffectCtx::time`] directly (not only through animated
 /// parameters). The renderer's layer cache folds the layer time into the key for these.
 /// The `time_dependence_is_declared` test checks the list against every registered effect.
 pub const TIME_DEPENDENT: &[&str] = &[
+    // Plexus: the Noise effector evolves and the Transform effector spins over time.
+    plexus::ID,
     "ec.distort.wavewarp",
     "ec.distort.ripple",
     "ec.generate.radiowaves",

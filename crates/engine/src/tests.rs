@@ -41,6 +41,7 @@ mod proxy;
 mod quick_offset;
 mod render_overwrite;
 mod replace_source;
+mod retro_plexus;
 mod rig3d;
 pub(crate) mod roto;
 mod scale_comp;
